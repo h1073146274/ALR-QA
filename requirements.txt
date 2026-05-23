@@ -1,0 +1,10 @@
+accelerate
+bitsandbytes
+numpy
+openai
+peft
+python-dotenv
+safetensors
+sentencepiece
+torch
+transformers

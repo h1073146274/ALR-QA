@@ -1,0 +1,12 @@
+.env.local
+__pycache__/
+*.pyc
+*.log
+*.pt
+*.npy
+outputs/
+runs/
+wandb/
+anchor_cache*/
+sft_out*/
+view_dataset*/

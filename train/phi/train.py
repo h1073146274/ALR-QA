@@ -16,12 +16,11 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import random
-import re
 from transformers import PreTrainedTokenizerBase
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from transformers import (
     AutoConfig,
@@ -279,26 +278,13 @@ def find_transformer_layers(model: nn.Module):
 
 
 
-def pick_layers(num_layers: int, mode: str = "quartile") -> List[int]:
+def pick_layers(num_layers: int) -> List[int]:
     if num_layers <= 0:
         raise ValueError("num_layers must be > 0")
-
-    if mode == "quartile":
-        s = sorted(set([num_layers // 4, num_layers // 2, (3 * num_layers) // 4, num_layers - 1]))
-        return s
-    elif mode == "middle_last":
-        s = sorted(set([num_layers // 2, (3 * num_layers) // 4, num_layers - 1]))
-        return s
-    elif mode == "mid_last2":
-        s = sorted(set([num_layers // 2, num_layers - 1]))
-        return s
-    else:
-        raise ValueError(f"Unknown layer picking mode: {mode}")
+    return sorted(set([num_layers // 4, num_layers // 2, (3 * num_layers) // 4, num_layers - 1]))
 
 
 def make_layer_weights(k: int) -> Tuple[List[float], List[float]]:
-    if k == 2:
-        return [1.0, 0.0], [0.0, 1.0]
     if k == 4:
         return [1.0, 0.7, 0.4, 0.2], [0.2, 0.4, 0.7, 1.0]
     doc = []
@@ -401,59 +387,6 @@ def prompt_end_index(labels: torch.Tensor, attention_mask: torch.Tensor) -> torc
     return idx
 
 
-ANCHOR_HEADERS = [
-    "[Article Summary]",
-    "[Doc Keywords]",
-    "[Document Anchor]",
-    "[Document Keywords]",
-    "[Chunk Summary]",
-    "[Chunk Keywords]",
-    "[Chunk Anchor]",
-]
-DOC_ANCHOR_HEADERS = ["[Article Summary]", "[Doc Keywords]", "[Document Anchor]", "[Document Keywords]"]
-CHUNK_ANCHOR_HEADERS = ["[Chunk Summary]", "[Chunk Keywords]", "[Chunk Anchor]"]
-
-def _bucket_from_row(row: Dict[str, Any], prompt_text: str) -> int:
-    mode = str(row.get("anchor_mode", "") or "").strip().lower()
-    mode_map = {
-        "dual": 0,
-        "doc_only": 1,
-        "chunk_only": 2,
-        "none": 3,
-    }
-    if mode in mode_map:
-        return mode_map[mode]
-
-    has_doc = any(h in prompt_text for h in DOC_ANCHOR_HEADERS)
-    has_chunk = any(h in prompt_text for h in CHUNK_ANCHOR_HEADERS)
-    if has_doc and has_chunk:
-        return 0
-    if has_doc:
-        return 1
-    if has_chunk:
-        return 2
-    return 3
-
-def _remove_anchor_block(text: str, header: str) -> str:
-    heads = "|".join(re.escape(h) for h in ANCHOR_HEADERS)
-    pat = rf"{re.escape(header)}\s*[\s\S]*?(?=(?:\n(?:{heads}))|\Z)"
-    return re.sub(pat, "", text, count=1)
-
-def _truncate_after_header(text: str, header: str, keep_words: int) -> str:
-    if keep_words <= 0:
-        return text
-    heads = "|".join(re.escape(h) for h in ANCHOR_HEADERS)
-    pat = rf"({re.escape(header)}\s*)([\s\S]*?)(?=(?:\n(?:{heads}))|\Z)"
-    m = re.search(pat, text)
-    if not m:
-        return text
-    prefix = m.group(1)
-    body = m.group(2).strip()
-    words = body.split()
-    body2 = " ".join(words[:keep_words])
-    repl = prefix + (body2 + "\n" if body2 else "\n")
-    return text[:m.start()] + repl + text[m.end():]
-
 # -------------------------
 # Dataset & Collator
 # -------------------------
@@ -466,14 +399,6 @@ class JSONLSFTDataset(Dataset):
         add_task_prefix: bool = True,
         pooling_mode: str = "mid",
         mid_token: str = "<|MID|>",
-        drop_doc_anchor_prob=0.0,
-        drop_chunk_anchor_prob=0.0,
-        anchor_trunc_words=0,
-        anchor_dropout_seed=1234,
-        forbid_both_drop=True,
-        allow_both_drop: bool = False,
-        drop_warmup_epochs=0.5,
-        drop_ramp_epochs=0.5,
     ):
         self.jsonl_path = jsonl_path
         self.tokenizer = tokenizer
@@ -481,16 +406,6 @@ class JSONLSFTDataset(Dataset):
         self.add_task_prefix = add_task_prefix
         self.pooling_mode = str(pooling_mode)
         self.mid_token = str(mid_token)
-        self.drop_doc_anchor_prob = drop_doc_anchor_prob
-        self.drop_chunk_anchor_prob = drop_chunk_anchor_prob
-        self.anchor_trunc_words = anchor_trunc_words
-        self.rng = random.Random(anchor_dropout_seed)
-
-        self.forbid_both_drop = bool(forbid_both_drop) and (not allow_both_drop)
-        self.drop_warmup_epochs = float(drop_warmup_epochs)
-        self.drop_ramp_epochs = float(drop_ramp_epochs)
-
-        self._epoch_progress = 0.0
 
         self.rows = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -520,43 +435,12 @@ class JSONLSFTDataset(Dataset):
                     mask[vid] = 1
             self._row_observed_view_mask.append(mask)
 
-        self._raw_bucket: List[int] = []
-        self._raw_has_doc: List[int] = []
-        self._raw_has_chunk: List[int] = []
-
-        for i, row in enumerate(self.rows):
-            prompt_raw = (
-                row.get("prompt")
-                or row.get("instruction")
-                or row.get("input")
-                or row.get("text")
-                or ""
-            )
-            b = _bucket_from_row(row, prompt_raw)
-            has_doc = 1 if b in (0, 1) else 0
-            has_chunk = 1 if b in (0, 2) else 0
-            self._raw_bucket.append(b)
-            self._raw_has_doc.append(has_doc)
-            self._raw_has_chunk.append(has_chunk)
-
         self.tokenizer.padding_side = "right"
 
     def __len__(self):
         return len(self.rows)
 
-    def set_epoch_progress(self, epoch_progress: float):
-        self._epoch_progress = float(epoch_progress)
-
-    def _curriculum_scale(self) -> float:
-        e = self._epoch_progress
-        if e < self.drop_warmup_epochs:
-            return 0.0
-        if self.drop_ramp_epochs <= 0:
-            return 1.0
-        t = (e - self.drop_warmup_epochs) / self.drop_ramp_epochs
-        return max(0.0, min(1.0, t))
-
-    def _format_pair(self, row: Dict[str, Any]) -> Tuple[str, str, int, int, int]:
+    def _format_pair(self, row: Dict[str, Any]) -> Tuple[str, str]:
         task = row.get("task", "")
         prompt = row.get("prompt", row.get("instruction", row.get("input", row.get("text", ""))))
         response = row.get("response", row.get("output", ""))
@@ -565,63 +449,21 @@ class JSONLSFTDataset(Dataset):
         if self.add_task_prefix and task:
             task_line = f"Task: {task}\n"
 
-        p0 = prompt
-        p = p0
-
-        scale = self._curriculum_scale()
-        p_doc = self.drop_doc_anchor_prob * scale
-        p_chunk = self.drop_chunk_anchor_prob * scale
-
-        drop_doc = 1 if (p_doc > 0 and self.rng.random() < p_doc) else 0
-        drop_chunk = 1 if (p_chunk > 0 and self.rng.random() < p_chunk) else 0
-        both_drop = 1 if (drop_doc == 1 and drop_chunk == 1) else 0
-
-        if both_drop == 1 and self.forbid_both_drop:
-            if self.rng.random() < 0.5:
-                drop_doc = 0
-            else:
-                drop_chunk = 0
-            both_drop = 0
-
-        if drop_doc == 1:
-            for header in DOC_ANCHOR_HEADERS:
-                p = _remove_anchor_block(p, header)
-        else:
-            if self.anchor_trunc_words > 0:
-                for header in DOC_ANCHOR_HEADERS:
-                    p = _truncate_after_header(p, header, self.anchor_trunc_words)
-
-        if drop_chunk == 1:
-            for header in CHUNK_ANCHOR_HEADERS:
-                p = _remove_anchor_block(p, header)
-        else:
-            if self.anchor_trunc_words > 0:
-                for header in CHUNK_ANCHOR_HEADERS:
-                    p = _truncate_after_header(p, header, self.anchor_trunc_words)
-
         if self.pooling_mode == "mid":
-            prompt_text = f"{task_line}{p.strip()}\n{self.mid_token}\n\n### Response:\n"
+            prompt_text = f"{task_line}{prompt.strip()}\n{self.mid_token}\n\n### Response:\n"
         else:
-            prompt_text = f"{task_line}{p.strip()}\n\n### Response:\n"
+            prompt_text = f"{task_line}{prompt.strip()}\n\n### Response:\n"
         resp_text = response.strip()
-        return prompt_text, resp_text, drop_doc, drop_chunk, both_drop
+        return prompt_text, resp_text
 
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row_idx = idx
         r = self.rows[row_idx]
-        prompt_text, resp_text, drop_doc, drop_chunk, both_drop = self._format_pair(r)
+        prompt_text, resp_text = self._format_pair(r)
         anchor_row_idx = r.get("anchor_row_idx", r.get("anchor_row", r.get("anchor_idx", None)))
         if anchor_row_idx is None:
             anchor_row_idx = row_idx
-
-        raw_bucket = int(self._raw_bucket[row_idx])
-        raw_has_doc = int(self._raw_has_doc[row_idx])
-        raw_has_chunk = int(self._raw_has_chunk[row_idx])
-
-        eff_has_doc = 1 if (raw_has_doc == 1 and drop_doc == 0) else 0
-        eff_has_chunk = 1 if (raw_has_chunk == 1 and drop_chunk == 0) else 0
-        eff_bucket = 0 if (eff_has_doc and eff_has_chunk) else (1 if eff_has_doc else (2 if eff_has_chunk else 3))
 
         tok_prompt = self.tokenizer(prompt_text, add_special_tokens=False, return_tensors=None)
         tok_resp = self.tokenizer(resp_text, add_special_tokens=False, return_tensors=None)
@@ -650,13 +492,6 @@ class JSONLSFTDataset(Dataset):
             "anchor_row_idx": int(anchor_row_idx),
             "view_id": int(self._row_view_id[row_idx]),
             "observed_view_mask": self._row_observed_view_mask[row_idx],
-            "drop_doc": int(drop_doc),
-            "drop_chunk": int(drop_chunk),
-            "both_drop": int(both_drop),
-            "raw_bucket": int(raw_bucket),
-            "eff_bucket": int(eff_bucket),
-            "raw_has_doc": int(raw_has_doc),
-            "raw_has_chunk": int(raw_has_chunk),
         }
 
 @dataclass
@@ -674,14 +509,6 @@ class DataCollatorWithPadding:
         for k in [
             "anchor_row_idx",
             "view_id",
-            "drop_doc",
-            "drop_chunk",
-            "both_drop",
-            "raw_bucket",
-            "eff_bucket",
-            "raw_has_doc",
-            "raw_has_chunk",
-            "curr_phase",
         ]:
             if k in batch and not isinstance(batch[k], torch.Tensor):
                 batch[k] = torch.tensor(batch[k], dtype=torch.long)
@@ -696,13 +523,7 @@ class DataCollatorWithPadding:
 class PooledLayerHook:
     SKIP_DURING_EXTERNAL_FORWARD = False
 
-    def __init__(self, layers: List[nn.Module], layer_ids: List[int], drop_doc_anchor_prob=0.0,
-             drop_chunk_anchor_prob=0.0,
-             anchor_trunc_words=0,
-             anchor_dropout_seed=1234,
-             forbid_both_drop=True,
-             drop_warmup_epochs=0.5,
-             drop_ramp_epochs=0.5):
+    def __init__(self, layers: List[nn.Module], layer_ids: List[int]):
         self.layers = layers
         self.layer_ids = layer_ids
         self.handles = []
@@ -747,17 +568,12 @@ class DualAnchorTrainer(Trainer):
         view_anchor_emb: Optional[torch.Tensor],
         view_prototypes: Optional[torch.Tensor],
         alpha: float,
-        beta: float,
-        gamma: float,
-        rho_multi_pos: float,
-        gamma_align: float,
-        route_tau: float,
-        energy_tau: float,
+        beta_route: float,
+        delta_vgc: float,
         layer_ids: List[int],
         lambda_doc: List[float],
         lambda_chunk: List[float],
         lambda_view: Optional[List[float]] = None,
-        perturb_eps: float = 0.0,
         pooling_mode: str = "prompt_end",
         mid_token_id: Optional[int] = None,
         **kwargs,
@@ -769,18 +585,13 @@ class DualAnchorTrainer(Trainer):
         self.view_anchor_emb = view_anchor_emb
         self.view_prototypes = view_prototypes
         self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.rho_multi_pos = rho_multi_pos
-        self.gamma_align = gamma_align
-        self.route_tau = route_tau
-        self.energy_tau = energy_tau
+        self.beta_route = beta_route
+        self.delta_vgc = delta_vgc
         self.layer_ids = layer_ids
         self.lambda_doc = lambda_doc
         self.lambda_chunk = lambda_chunk
         self.lambda_view = lambda_view
         self.use_view_anchor = self.view_anchor_emb is not None and self.lambda_view is not None
-        self.perturb_eps = perturb_eps
 
         self.pooling_mode = str(pooling_mode)
         self.mid_token_id = int(mid_token_id) if mid_token_id is not None else None
@@ -812,7 +623,7 @@ class DualAnchorTrainer(Trainer):
             a_view = self.view_anchor_emb.index_select(0, anchor_row_idx.cpu()).to(device=device, dtype=torch.float32)
         return a_doc, a_chunk, a_view
 
-    def _anchor_and_smooth_loss(
+    def _anchor_loss(
         self,
         zs: List[torch.Tensor],
         a_doc: torch.Tensor,
@@ -827,15 +638,9 @@ class DualAnchorTrainer(Trainer):
         proj_chunk: nn.Module = getattr(base, "anchor_proj_chunk")
         proj_view: Optional[nn.Module] = getattr(base, "anchor_proj_view", None) if self.use_view_anchor else None
 
-        loss_anchor = 0.0
-        loss_smooth = 0.0
+        loss_anchor = torch.tensor(0.0, device=device)
 
         metrics: Dict[str, float] = {}
-
-        for i in range(len(zs) - 1):
-            z_next = torch.nan_to_num(zs[i + 1].float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            z_cur = torch.nan_to_num(zs[i].float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            loss_smooth = loss_smooth + (z_next - z_cur).pow(2).mean()
 
         for i, z in enumerate(zs):
             zf = torch.nan_to_num(z.float(), nan=0.0, posinf=1e4, neginf=-1e4)
@@ -872,8 +677,7 @@ class DualAnchorTrainer(Trainer):
                 metrics[f"cos_view_L{lid}"] = float(cos_view.mean().detach().cpu())
 
         metrics["loss_anchor"] = float(loss_anchor.detach().cpu())
-        metrics["loss_smooth"] = float(loss_smooth.detach().cpu())
-        return loss_anchor, loss_smooth, metrics
+        return loss_anchor, metrics
 
     def _compute_router_losses(
         self,
@@ -889,14 +693,14 @@ class DualAnchorTrainer(Trainer):
         zero = torch.tensor(0.0, device=device)
         metrics: Dict[str, float] = {}
         if proj_route is None:
-            metrics["loss_multi_pos"] = 0.0
-            metrics["loss_energy_align"] = 0.0
+            metrics["loss_route"] = 0.0
+            metrics["loss_vgc"] = 0.0
             return zero, zero, metrics, None
 
         route_logits = proj_route(z_route)
         vdim = int(route_logits.size(-1))
 
-        loss_multi_pos = zero
+        loss_route = zero
         if observed_view_mask is not None and observed_view_mask.numel() > 0:
             mask = observed_view_mask.to(device=device, dtype=torch.float32)
             if mask.size(-1) != vdim:
@@ -904,42 +708,31 @@ class DualAnchorTrainer(Trainer):
             pos_cnt = mask.sum(dim=-1, keepdim=True)
             valid = (pos_cnt.squeeze(-1) > 0)
             if valid.any():
-                tgt = mask[valid] / pos_cnt[valid].clamp_min(1.0)
-                log_p = F.log_softmax(route_logits[valid] / max(self.route_tau, 1e-6), dim=-1)
-                loss_multi_pos = -(tgt * log_p).sum(dim=-1).mean()
+                loss_route = F.binary_cross_entropy_with_logits(route_logits[valid], mask[valid], reduction="mean")
 
-        loss_energy_align = zero
-        if self.gamma_align > 0 and proj_view is not None and self.view_prototypes is not None:
+        loss_vgc = zero
+        if self.delta_vgc > 0 and proj_view is not None and self.view_prototypes is not None:
             proto = torch.nan_to_num(self.view_prototypes.to(device=device, dtype=torch.float32), nan=0.0, posinf=1e4, neginf=-1e4)
             if proto.size(0) != vdim:
                 raise ValueError(f"view_prototypes V={proto.size(0)} != route dim {vdim}")
             z_view = F.normalize(torch.nan_to_num(proj_view(z_route).float(), nan=0.0, posinf=1e4, neginf=-1e4), p=2, dim=-1, eps=1e-6)
             proto_n = F.normalize(proto, p=2, dim=-1, eps=1e-6)
             cos = torch.matmul(z_view, proto_n.t())
-            e_view = 1.0 - cos
-            tgt = F.softmax(-e_view / max(self.energy_tau, 1e-6), dim=-1).detach()
-            log_p = F.log_softmax(route_logits / max(self.route_tau, 1e-6), dim=-1)
-            loss_energy_align = F.kl_div(log_p, tgt, reduction="batchmean")
-            metrics["e_view_mean"] = float(e_view.mean().detach().cpu())
+            tgt = F.softmax(cos, dim=-1).detach()
+            log_p = F.log_softmax(route_logits, dim=-1)
+            loss_vgc = F.kl_div(log_p, tgt, reduction="batchmean")
+            metrics["view_cos_mean"] = float(cos.mean().detach().cpu())
 
-        metrics["loss_multi_pos"] = float(loss_multi_pos.detach().cpu())
-        metrics["loss_energy_align"] = float(loss_energy_align.detach().cpu())
+        metrics["loss_route"] = float(loss_route.detach().cpu())
+        metrics["loss_vgc"] = float(loss_vgc.detach().cpu())
         metrics["route_logit_mean"] = float(route_logits.mean().detach().cpu())
         metrics["route_logit_std"] = float(route_logits.std().detach().cpu())
-        return loss_multi_pos, loss_energy_align, metrics, route_logits
+        return loss_route, loss_vgc, metrics, route_logits
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         anchor_row_idx = inputs.pop("anchor_row_idx")
         view_id = inputs.pop("view_id", None)
         observed_view_mask = inputs.pop("observed_view_mask", None)
-        drop_doc = inputs.pop("drop_doc", None)
-        drop_chunk = inputs.pop("drop_chunk", None)
-        both_drop = inputs.pop("both_drop", None)
-        raw_bucket = inputs.pop("raw_bucket", None)
-        eff_bucket = inputs.pop("eff_bucket", None)
-        raw_has_doc = inputs.pop("raw_has_doc", None)
-        raw_has_chunk = inputs.pop("raw_has_chunk", None)
-        curr_phase = inputs.pop("curr_phase", None)
         labels = inputs.get("labels")
         attention_mask = inputs.get("attention_mask")
 
@@ -972,8 +765,8 @@ class DualAnchorTrainer(Trainer):
                 raise RuntimeError(f"Missing hook cache for layer {lid}.")
             zs.append(self._hook.cache[lid])
 
-        loss_anchor, loss_smooth, metric = self._anchor_and_smooth_loss(zs, a_doc, a_chunk, a_view)
-        loss_multi_pos, loss_energy_align, route_metric, route_logits = self._compute_router_losses(
+        loss_anchor, metric = self._anchor_loss(zs, a_doc, a_chunk, a_view)
+        loss_route, loss_vgc, route_metric, route_logits = self._compute_router_losses(
             zs=zs,
             observed_view_mask=observed_view_mask,
         )
@@ -982,53 +775,24 @@ class DualAnchorTrainer(Trainer):
         total_loss = (
             lm_loss
             + self.alpha * loss_anchor
-            + self.rho_multi_pos * loss_multi_pos
-            + self.gamma_align * loss_energy_align
-            + self.beta * loss_smooth
+            + self.beta_route * loss_route
+            + self.delta_vgc * loss_vgc
         )
         for name, value in {
             "loss_lm": lm_loss,
             "loss_anchor": loss_anchor,
-            "loss_multi_pos": loss_multi_pos,
-            "loss_energy_align": loss_energy_align,
-            "loss_smooth": loss_smooth,
-            "total_loss_pre_perturb": total_loss,
+            "loss_route": loss_route,
+            "loss_vgc": loss_vgc,
+            "total_loss": total_loss,
         }.items():
             _assert_finite_tensor(name, value)
-
-        loss_pert = None
-        if self.gamma > 0 and self.perturb_eps > 0:
-            self._hook.clear()
-            input_ids = inputs["input_ids"]
-            embed = model.get_input_embeddings()(input_ids)
-            noise = torch.randn_like(embed) * self.perturb_eps
-            embed_pert = embed + noise
-
-            _ = model(
-                inputs_embeds=embed_pert,
-                attention_mask=inputs["attention_mask"],
-                use_cache=False,
-            )
-
-            zs_pert = []
-            for lid in self.layer_ids:
-                zs_pert.append(self._hook.cache[lid])
-
-            loss_anchor_p, loss_smooth_p, metric_p = self._anchor_and_smooth_loss(zs_pert, a_doc, a_chunk, a_view)
-            loss_pert = loss_anchor_p + loss_smooth_p
-            total_loss = total_loss + self.gamma * loss_pert
-            _assert_finite_tensor("loss_perturbed", loss_pert)
-            _assert_finite_tensor("total_loss_post_perturb", total_loss)
-            metric["loss_perturbed"] = float(loss_pert.detach().cpu())
 
         metric.update(
             {
                 "loss_lm": float(lm_loss.detach().cpu()),
                 "alpha": float(self.alpha),
-                "beta": float(self.beta),
-                "gamma": float(self.gamma),
-                "rho_multi_pos": float(self.rho_multi_pos),
-                "gamma_align": float(self.gamma_align),
+                "beta_route": float(self.beta_route),
+                "delta_vgc": float(self.delta_vgc),
                 "use_view_anchor": 1.0 if self.use_view_anchor else 0.0,
             }
         )
@@ -1040,25 +804,6 @@ class DualAnchorTrainer(Trainer):
                 acc = (pred[valid] == vid[valid]).float().mean()
                 metric["route_current_view_acc"] = float(acc.detach().cpu())
 
-        if drop_doc is not None:
-            metric["drop_doc_rate"] = float(drop_doc.float().mean().detach().cpu())
-
-        if drop_chunk is not None:
-            metric["drop_chunk_rate"] = float(drop_chunk.float().mean().detach().cpu())
-
-        if both_drop is not None:
-            metric["both_drop_rate"] = float(both_drop.float().mean().detach().cpu())
-        if raw_bucket is not None:
-            metric["raw_bucket"] = float(raw_bucket.float().mean().detach().cpu())
-        if eff_bucket is not None:
-            metric["eff_bucket"] = float(eff_bucket.float().mean().detach().cpu())
-        if raw_has_doc is not None:
-            metric["raw_has_doc"] = float(raw_has_doc.float().mean().detach().cpu())
-        if raw_has_chunk is not None:
-            metric["raw_has_chunk"] = float(raw_has_chunk.float().mean().detach().cpu())
-        if curr_phase is not None:
-            metric["curr_phase"] = float(curr_phase.float().mean().detach().cpu())
-
         self._last_custom_metrics = metric
 
         return (total_loss, outputs) if return_outputs else total_loss
@@ -1068,16 +813,6 @@ class DualAnchorTrainer(Trainer):
             self._hook.remove()
         except Exception:
             pass
-
-
-class AnchorDropoutCurriculumCallback(TrainerCallback):
-    def __init__(self, train_dataset):
-        self.ds = train_dataset
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if hasattr(self.ds, "set_epoch_progress") and state.epoch is not None:
-            self.ds.set_epoch_progress(float(state.epoch))
-        return control
 
 
 class JsonlLoggingCallback(TrainerCallback):
@@ -1125,118 +860,6 @@ class FiniteParameterCallback(TrainerCallback):
         return control
 
 
-class BucketEvalCallback(TrainerCallback):
-    def __init__(
-        self,
-        eval_dataset: Dataset,
-        collator,
-        eval_steps: int,
-        log_jsonl_path: str,
-        batch_size: int = 1,
-        max_batches: int = 0,
-    ):
-        self.eval_dataset = eval_dataset
-        self.collator = collator
-        self.eval_steps = int(eval_steps)
-        self.log_jsonl_path = log_jsonl_path
-        self.batch_size = int(batch_size)
-        self.max_batches = int(max_batches)
-
-    @torch.no_grad()
-    def _run_bucket_eval(self, model) -> Dict[str, float]:
-        model_was_training = model.training
-        model.eval()
-        device = next(model.parameters()).device
-        PooledLayerHook.SKIP_DURING_EXTERNAL_FORWARD = True
-
-        try:
-            dl = DataLoader(
-                self.eval_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                collate_fn=self.collator,
-            )
-
-            loss_sums = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}
-            count_sums = {0: 0, 1: 0, 2: 0, 3: 0}
-
-            for bi, batch in enumerate(dl):
-                if self.max_batches > 0 and bi >= self.max_batches:
-                    break
-
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                labels = batch["labels"].to(device)
-                raw_bucket = batch["raw_bucket"].to(device)
-
-                out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-                logits = out.logits
-
-                shift_logits = logits[:, :-1, :].contiguous()
-                shift_labels = labels[:, 1:].contiguous()
-
-                vocab_size = shift_logits.size(-1)
-                token_loss = F.cross_entropy(
-                    shift_logits.view(-1, vocab_size),
-                    shift_labels.view(-1),
-                    reduction="none",
-                    ignore_index=-100,
-                ).view(shift_labels.size(0), shift_labels.size(1))
-
-                token_mask = (shift_labels != -100).float()
-                per_sample_den = token_mask.sum(dim=1).clamp_min(1.0)
-                per_sample_loss = (token_loss * token_mask).sum(dim=1) / per_sample_den
-
-                for b in range(per_sample_loss.size(0)):
-                    k = int(raw_bucket[b].item())
-                    if k not in loss_sums:
-                        continue
-                    loss_sums[k] += float(per_sample_loss[b].item())
-                    count_sums[k] += 1
-
-            metrics: Dict[str, float] = {}
-            total_n = 0
-            total_loss = 0.0
-            for k in [0, 1, 2, 3]:
-                n = count_sums[k]
-                mean_lm = loss_sums[k] / n if n > 0 else float("nan")
-                metrics[f"eval_bucket{k}_lm_loss"] = mean_lm
-                metrics[f"eval_bucket{k}_n"] = float(n)
-                if n > 0:
-                    total_n += n
-                    total_loss += loss_sums[k]
-
-            metrics["eval_bucket_all_lm_loss"] = (total_loss / total_n) if total_n > 0 else float("nan")
-            metrics["eval_bucket3_no_anchor_lm_loss"] = metrics["eval_bucket3_lm_loss"]
-            return metrics
-        finally:
-            PooledLayerHook.SKIP_DURING_EXTERNAL_FORWARD = False
-            if model_was_training:
-                model.train()
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if self.eval_steps <= 0:
-            return control
-        if state.global_step <= 0 or (state.global_step % self.eval_steps != 0):
-            return control
-
-        model = kwargs.get("model", None)
-        if model is None:
-            return control
-
-        metrics = self._run_bucket_eval(model)
-        payload = dict(metrics)
-        payload["bucket_eval"] = 1
-        payload["step"] = int(state.global_step)
-        payload["epoch"] = float(state.epoch) if state.epoch is not None else None
-
-        if self.log_jsonl_path:
-            os.makedirs(os.path.dirname(self.log_jsonl_path), exist_ok=True)
-            with open(self.log_jsonl_path, "a", encoding="utf-8") as fp:
-                fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        return control
-
-
 # -------------------------
 # Main
 # -------------------------
@@ -1250,7 +873,6 @@ def main():
     ap.add_argument("--chunk_anchor_pt", type=str, required=True, help="chunk_anchor_emb.pt")
     ap.add_argument("--view_anchor_pt", type=str, default="", help="optional: view_anchor_emb.pt")
     ap.add_argument("--output_dir", type=str, required=True)
-    ap.add_argument("--eval_jsonl", type=str, default="", help="optional eval jsonl for bucketed lm-loss evaluation")
 
     # training
     ap.add_argument("--max_seq_len", type=int, default=2048)
@@ -1261,7 +883,6 @@ def main():
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--logging_steps", type=int, default=10)
-    ap.add_argument("--eval_steps", type=int, default=0, help="run bucket eval every N optimizer steps; 0 disables")
     ap.add_argument("--save_steps", type=int, default=200)
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
     ap.add_argument("--finite_check_steps", type=int, default=25, help="check trainable parameters for NaN/Inf every N optimizer steps")
@@ -1292,16 +913,11 @@ def main():
         help="auto selects Phi qkv_proj/o_proj/gate_up_proj/down_proj; otherwise pass comma-separated module suffixes",
     )
 
-    # dual-anchor losses
+    # formula losses
     ap.add_argument("--alpha", type=float, default=0.10, help="weight for anchor loss")
-    ap.add_argument("--beta", type=float, default=0.01, help="weight for smooth loss")
     ap.add_argument("--view_lambda_scale", type=float, default=0.5, help="per-layer view weight scale relative to chunk weights")
-    ap.add_argument("--rho_multi_pos", type=float, default=0.05, help="weight for multi-positive routing loss")
-    ap.add_argument("--gamma_align", type=float, default=0.05, help="weight for route-energy alignment loss")
-    ap.add_argument("--route_tau", type=float, default=1.0, help="temperature for router logits")
-    ap.add_argument("--energy_tau", type=float, default=1.0, help="temperature for view-energy target distribution")
-    ap.add_argument("--gamma", type=float, default=0.0, help="weight for optional perturbed loss (default off)")
-    ap.add_argument("--perturb_eps", type=float, default=0.0, help="std of gaussian noise on embeddings for perturbed branch")
+    ap.add_argument("--beta_route", type=float, default=0.05, help="weight for routing BCE loss")
+    ap.add_argument("--delta_vgc", type=float, default=0.05, help="weight for view-geometry consistency loss")
 
     # pooling alignment (Scheme B)
     ap.add_argument(
@@ -1318,17 +934,6 @@ def main():
         default=True,
         help="Auto-add MID token to tokenizer and resize embeddings if missing.",
     )
-
-    # layers
-    ap.add_argument("--layer_pick_mode", type=str, default="quartile", choices=["quartile", "middle_last", "mid_last2"])
-    ap.add_argument("--drop_doc_anchor_prob", type=float, default=0.0)
-    ap.add_argument("--drop_chunk_anchor_prob", type=float, default=0.0)
-    ap.add_argument("--anchor_trunc_words", type=int, default=0)
-    ap.add_argument("--anchor_dropout_seed", type=int, default=1234)
-    ap.add_argument("--drop_warmup_epochs", type=float, default=0.5)
-    ap.add_argument("--drop_ramp_epochs", type=float, default=0.5)
-    ap.add_argument("--allow_both_drop", action="store_true", help="allow dropping both doc and chunk anchors in one sample")
-    ap.add_argument("--eval_max_batches", type=int, default=0, help="cap eval dataloader batches per eval run; 0 means full eval set")
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -1420,7 +1025,7 @@ def main():
     # layers & weights
     layers = find_transformer_layers(model)
     num_layers = len(layers)
-    layer_ids = pick_layers(num_layers, mode=args.layer_pick_mode)
+    layer_ids = pick_layers(num_layers)
     lambda_doc, lambda_chunk = make_layer_weights(len(layer_ids))
     lambda_view = make_view_layer_weights(lambda_chunk, args.view_lambda_scale) if view_anchor is not None else None
 
@@ -1453,13 +1058,6 @@ def main():
         add_task_prefix=True,
         pooling_mode=args.pooling_mode,
         mid_token=args.mid_token,
-        drop_doc_anchor_prob=args.drop_doc_anchor_prob,
-        drop_chunk_anchor_prob=args.drop_chunk_anchor_prob,
-        anchor_trunc_words=args.anchor_trunc_words,
-        anchor_dropout_seed=args.anchor_dropout_seed,
-        allow_both_drop=args.allow_both_drop,
-        drop_warmup_epochs=args.drop_warmup_epochs,
-        drop_ramp_epochs=args.drop_ramp_epochs,
     )
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
@@ -1497,17 +1095,12 @@ def main():
         view_anchor_emb=view_anchor,
         view_prototypes=view_prototypes,
         alpha=args.alpha,
-        beta=args.beta,
-        gamma=args.gamma,
-        rho_multi_pos=args.rho_multi_pos,
-        gamma_align=args.gamma_align,
-        route_tau=args.route_tau,
-        energy_tau=args.energy_tau,
+        beta_route=args.beta_route,
+        delta_vgc=args.delta_vgc,
         layer_ids=layer_ids,
         lambda_doc=lambda_doc,
         lambda_chunk=lambda_chunk,
         lambda_view=lambda_view,
-        perturb_eps=args.perturb_eps,
         pooling_mode=args.pooling_mode,
         mid_token_id=mid_token_id,
         tokenizer=tokenizer,
@@ -1520,34 +1113,7 @@ def main():
         else:
             log_path = args.log_jsonl
 
-    trainer.add_callback(AnchorDropoutCurriculumCallback(train_ds))
     trainer.add_callback(FiniteParameterCallback(check_steps=args.finite_check_steps))
-    if args.eval_jsonl and args.eval_steps > 0 and log_path:
-        eval_ds = JSONLSFTDataset(
-            jsonl_path=args.eval_jsonl,
-            tokenizer=tokenizer,
-            max_seq_len=args.max_seq_len,
-            add_task_prefix=True,
-            pooling_mode=args.pooling_mode,
-            mid_token=args.mid_token,
-            drop_doc_anchor_prob=0.0,
-            drop_chunk_anchor_prob=0.0,
-            anchor_trunc_words=0,
-            anchor_dropout_seed=args.anchor_dropout_seed,
-            allow_both_drop=args.allow_both_drop,
-            drop_warmup_epochs=0.0,
-            drop_ramp_epochs=0.0,
-        )
-        trainer.add_callback(
-            BucketEvalCallback(
-                eval_dataset=eval_ds,
-                collator=collator,
-                eval_steps=args.eval_steps,
-                log_jsonl_path=log_path,
-                batch_size=args.per_device_train_batch_size,
-                max_batches=args.eval_max_batches,
-            )
-        )
     if log_path:
         trainer.add_callback(JsonlLoggingCallback(log_path))
 

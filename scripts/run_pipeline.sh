@@ -83,7 +83,6 @@ train_model() {
   "${PYTHON_BIN}" "${TRAIN_ENTRY}" \
     --model_name_or_path "${BASE_MODEL}" \
     --train_jsonl "${train_jsonl}" \
-    --eval_jsonl "${EVAL_JSONL:-}" \
     --doc_anchor_pt "${DOC_ANCHOR}" \
     --chunk_anchor_pt "${CHUNK_ANCHOR}" \
     --view_anchor_pt "${VIEW_ANCHOR:-}" \
@@ -98,9 +97,8 @@ train_model() {
     --max_steps "${MAX_STEPS:--1}" \
     --learning_rate "${LR:-2e-4}" \
     --alpha "${ALPHA:-0.08}" \
-    --beta "${BETA:-0}" \
-    --rho_multi_pos "${RHO_MULTI_POS:-0.05}" \
-    --gamma_align "${GAMMA_ALIGN:-0.05}" \
+    --beta_route "${BETA_ROUTE:-0.05}" \
+    --delta_vgc "${DELTA_VGC:-0.05}" \
     --logging_steps "${LOGGING_STEPS:-10}" \
     --save_steps "${SAVE_STEPS:-500}" \
     --seed "${SEED:-42}"
@@ -150,7 +148,6 @@ infer_model() {
     --device "${DEVICE}" \
     --dtype "${DTYPE}" \
     --K "${K:-3}" \
-    --budget_B "${BUDGET_B:-3}" \
     --seed "${SEED:-42}"
 }
 

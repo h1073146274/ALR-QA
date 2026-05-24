@@ -48,23 +48,6 @@ VIEWS: Dict[str, str] = {
     "quantitative": "Ask for numbers, metrics, time, stages, or other structured facts answerable from the Body.",
 }
 
-# pair rules (light, deterministic; no embedding)
-MUTEX_GROUPS = [
-    {"causation", "mechanism", "impact"},
-    {"concept", "condition"},
-]
-PAIR_BONUS = {
-    ("causation", "impact"): 1.0,
-    ("impact", "causation"): 1.0,
-    ("mechanism", "impact"): 1.0,
-    ("impact", "mechanism"): 1.0,
-    ("comparison", "quantitative"): 1.0,
-    ("quantitative", "comparison"): 1.0,
-    ("evidence", "concept"): 1.0,
-    ("concept", "evidence"): 1.0,
-}
-
-
 # -------------------------
 # Import prompts
 # -------------------------
@@ -99,10 +82,6 @@ if hasattr(PROMPTS, "VIEW_DEFS") and isinstance(PROMPTS.VIEW_DEFS, dict):
     prompt_view_defs = dict(PROMPTS.VIEW_DEFS)
     if set(prompt_view_defs) == set(VIEWS):
         VIEWS = prompt_view_defs
-        if hasattr(PROMPTS, "VIEW_MUTEX_GROUPS"):
-            MUTEX_GROUPS = [set(g) for g in getattr(PROMPTS, "VIEW_MUTEX_GROUPS")]
-        if hasattr(PROMPTS, "VIEW_SYNERGY_PAIRS"):
-            PAIR_BONUS = {(a, b): 1.0 for (a, b) in getattr(PROMPTS, "VIEW_SYNERGY_PAIRS")}
 
 
 def _token_is_single_id(tokenizer: PreTrainedTokenizerBase, s: str) -> bool:
@@ -343,21 +322,11 @@ def find_transformer_layers(model: nn.Module) -> List[nn.Module]:
     return list(best_list)
 
 
-def pick_layers(num_layers: int, mode: str = "quartile") -> List[int]:
-    if mode == "quartile":
-        return sorted(set([num_layers // 4, num_layers // 2, (3 * num_layers) // 4, num_layers - 1]))
-    if mode == "middle_last":
-        return sorted(set([num_layers // 2, (3 * num_layers) // 4, num_layers - 1]))
-    if mode == "mid_last2":
-        return sorted(set([num_layers // 2, num_layers - 1]))
-    raise ValueError(f"Unknown mode: {mode}")
+def pick_layers(num_layers: int) -> List[int]:
+    return sorted(set([num_layers // 4, num_layers // 2, (3 * num_layers) // 4, num_layers - 1]))
 
 
 def make_layer_weights(k: int) -> Tuple[List[float], List[float]]:
-    # Recommended routing setup for 2-layer probe:
-    #   doc uses mid layer only, chunk uses last layer only.
-    if k == 2:
-        return [1.0, 0.0], [0.0, 1.0]
     if k == 4:
         return [1.0, 0.7, 0.4, 0.2], [0.2, 0.4, 0.7, 1.0]
     doc, chunk = [], []
@@ -1087,28 +1056,10 @@ def compute_anchor_energy_batch(
     )
 
 
-def coverage_bias(view: str, count_global: Dict[str, int], count_doc: Dict[str, int], eta_g: float, eta_d: float, eps: float) -> float:
+def coverage_bias(view: str, count_global: Dict[str, int], count_doc: Dict[str, int]) -> float:
     cg = count_global.get(view, 0)
     cd = count_doc.get(view, 0)
-    return float(eta_g * (torch.log(torch.tensor(1.0 / (eps + cg))).item()) +
-                 eta_d * (torch.log(torch.tensor(1.0 / (eps + cd))).item()))
-
-
-def pair_rule(view: str, selected: List[str], delta_mutex: float, delta_bonus: float) -> float:
-    """
-    Light deterministic rule to encourage distinct multi-view sets.
-    """
-    s = 0.0
-    # mutex penalty
-    for g in MUTEX_GROUPS:
-        if view in g and any(v in g for v in selected):
-            s -= delta_mutex
-            break
-    # bonus
-    for v0 in selected:
-        if (view, v0) in PAIR_BONUS:
-            s += delta_bonus
-    return float(s)
+    return float(-math.log(1.0 + float(cg) + float(cd)))
 
 
 def select_views_greedy(
@@ -1116,15 +1067,10 @@ def select_views_greedy(
     count_global: Dict[str, int],
     count_doc: Dict[str, int],
     K: int,
-    eta_g: float,
-    eta_d: float,
-    eps: float,
-    delta_mutex: float,
-    delta_bonus: float,
 ) -> List[str]:
     """
     Greedy selection:
-      score(view) = -energy + coverage_bias + pair_rule
+      score(view) = -energy + coverage_bias
     """
     selected: List[str] = []
     remaining = list(energies.keys())
@@ -1133,8 +1079,7 @@ def select_views_greedy(
         best_v = None
         best_score = -1e18
         for v in remaining:
-            base = -energies[v] + coverage_bias(v, count_global, count_doc, eta_g, eta_d, eps)
-            base += pair_rule(v, selected, delta_mutex=delta_mutex, delta_bonus=delta_bonus)
+            base = -energies[v] + coverage_bias(v, count_global, count_doc)
             if base > best_score:
                 best_score = base
                 best_v = v
@@ -1151,110 +1096,23 @@ def build_routing_energy(
     energies_docchunk: Dict[str, float],
     route_logits: Dict[str, Optional[float]],
     view_energies: Dict[str, Optional[float]],
-    route_weight: float,
-    docchunk_weight: float,
-    view_weight: float,
-    route_temperature: float,
 ) -> Dict[str, float]:
     """
     Convert heterogeneous signals to one comparable routing energy:
-      E_route = w_docchunk * E_docchunk + w_view * E_view - w_route * (logit / T)
+      E_route = E_docchunk + E_view - route_logit
     Lower is better.
     """
-    t = max(float(route_temperature), 1e-6)
     out: Dict[str, float] = {}
     for v, e_dc in energies_docchunk.items():
-        val = float(docchunk_weight) * float(e_dc)
+        val = float(e_dc)
         ev = view_energies.get(v, None)
         if ev is not None:
-            val += float(view_weight) * float(ev)
+            val += float(ev)
         rv = route_logits.get(v, None)
         if rv is not None:
-            val -= float(route_weight) * (float(rv) / t)
+            val -= float(rv)
         out[v] = float(val)
     return out
-
-
-def allocate_view_budget(
-    selected_views: List[str],
-    energies: Dict[str, float],
-    count_global: Dict[str, int],
-    B: int,
-    tau: float,
-    eps: float,
-) -> Dict[str, int]:
-    """
-    Allocate question budget per selected view:
-      w(v) = exp(-tau * E_route(v|c)) * 1 / (eps + count(v))
-      m(v) = max(1, round(B * w(v) / sum_w))
-    Then adjust so sum_v m(v) = B.
-    """
-    if not selected_views:
-        return {}
-
-    if B < len(selected_views):
-        print(f"[WARN] budget_B={B} < |S|={len(selected_views)}; raising B to {len(selected_views)}")
-        B = len(selected_views)
-
-    weights: Dict[str, float] = {}
-    for v in selected_views:
-        cnt = float(count_global.get(v, 0))
-        w = math.exp(-tau * float(energies.get(v, 0.0))) * (1.0 / (eps + cnt))
-        weights[v] = w
-
-    sum_w = sum(weights.values())
-    if sum_w <= 0:
-        # fallback: uniform allocation
-        base = {v: 1 for v in selected_views}
-        total = len(selected_views)
-        remain = B - total
-        if remain > 0:
-            for v in selected_views:
-                if remain <= 0:
-                    break
-                base[v] += 1
-                remain -= 1
-        return base
-
-    raw = {v: (B * weights[v] / sum_w) for v in selected_views}
-    base = {v: max(1, int(math.floor(raw[v]))) for v in selected_views}
-    total = sum(base.values())
-
-    if total < B:
-        # add to largest fractional parts
-        frac = sorted(selected_views, key=lambda v: (raw[v] - base[v]), reverse=True)
-        remain = B - total
-        for v in frac:
-            if remain <= 0:
-                break
-            base[v] += 1
-            remain -= 1
-    elif total > B:
-        # remove from smallest fractional parts (keep >=1)
-        frac = sorted(selected_views, key=lambda v: (raw[v] - base[v]))
-        over = total - B
-        for v in frac:
-            if over <= 0:
-                break
-            if base[v] > 1:
-                base[v] -= 1
-                over -= 1
-
-    # final sanity: if still off due to min-1 constraints, adjust uniformly
-    total = sum(base.values())
-    if total != B:
-        diff = B - total
-        step = 1 if diff > 0 else -1
-        diff = abs(diff)
-        idx = 0
-        while diff > 0:
-            v = selected_views[idx % len(selected_views)]
-            if step > 0 or base[v] > 1:
-                base[v] += step
-                diff -= 1
-            idx += 1
-
-    return base
 
 
 # -------------------------
@@ -1557,12 +1415,6 @@ def main():
 
     # Routing
     ap.add_argument("--K", type=int, default=2, help="number of views per chunk")
-    ap.add_argument("--layer_pick_mode", type=str, default="mid_last2", choices=["quartile", "middle_last", "mid_last2"])
-    ap.add_argument("--eta_g", type=float, default=0.3)
-    ap.add_argument("--eta_d", type=float, default=0.8)
-    ap.add_argument("--eps", type=float, default=1.0)
-    ap.add_argument("--delta_mutex", type=float, default=0.3)
-    ap.add_argument("--delta_bonus", type=float, default=0.2)
     ap.add_argument("--mid_token", type=str, default="<|MID|>", help="Dedicated MID token inserted before ### Response.")
     ap.add_argument(
         "--ensure_mid_token",
@@ -1583,16 +1435,10 @@ def main():
     ap.add_argument("--a_repetition_penalty", type=float, default=1.12, help="repetition penalty for answer generation")
     ap.add_argument("--a_no_repeat_ngram_size", type=int, default=3, help="no-repeat ngram size for answer generation")
     ap.add_argument("--a_max_sentences", type=int, default=1, help="postprocess: keep at most N sentences for answers")
-    ap.add_argument("--budget_B", type=int, default=4, help="total question budget per chunk (upper bound)")
     ap.add_argument("--answer_min_chars", type=int, default=12, help="min answer length (characters)")
     ap.add_argument("--answer_max_chars", type=int, default=160, help="max answer length (characters)")
     ap.add_argument("--answer_min_unique_ratio", type=float, default=0.4, help="min unique token ratio for answer")
     ap.add_argument("--answer_max_q_overlap", type=float, default=0.55, help="max token overlap ratio with question")
-    ap.add_argument("--tau", type=float, default=1.0, help="energy temperature for budget allocation")
-    ap.add_argument("--route_weight", type=float, default=1.0, help="weight of router current-view logit in fused routing energy")
-    ap.add_argument("--docchunk_energy_weight", type=float, default=1.0, help="weight of doc+chunk probe energy in fused routing energy")
-    ap.add_argument("--view_energy_weight", type=float, default=1.0, help="weight of view prototype energy in fused routing energy")
-    ap.add_argument("--route_temperature", type=float, default=1.0, help="temperature divisor for router logit in fused routing energy")
     ap.add_argument("--view_prototypes_pt", type=str, default="", help="optional path to view_prototypes.pt; default uses <lora_dir>/view_prototypes.pt")
     ap.add_argument("--seed", type=int, default=42)
 
@@ -1694,7 +1540,7 @@ def main():
 
     # layers & hook for probing
     layers = find_transformer_layers(model)
-    layer_ids = pick_layers(len(layers), mode=args.layer_pick_mode)
+    layer_ids = pick_layers(len(layers))
     lambda_doc, lambda_chunk = make_layer_weights(len(layer_ids))
     hook = PooledLayerHook(layers, layer_ids)
     hook.register()
@@ -1907,10 +1753,6 @@ def main():
             energies_docchunk=energies,
             route_logits=route_logits_cur,
             view_energies=energies_view,
-            route_weight=args.route_weight,
-            docchunk_weight=args.docchunk_energy_weight,
-            view_weight=args.view_energy_weight,
-            route_temperature=args.route_temperature,
         )
 
         # --------- select K views (greedy with coverage bias) ---------
@@ -1920,23 +1762,9 @@ def main():
             count_global=count_global,
             count_doc=count_doc,
             K=args.K,
-            eta_g=args.eta_g,
-            eta_d=args.eta_d,
-            eps=args.eps,
-            delta_mutex=args.delta_mutex,
-            delta_bonus=args.delta_bonus,
         )
 
-        # allocate per-view question budget using routing energy + coverage prior
-        budget_by_view = allocate_view_budget(
-            selected_views=selected_views,
-            energies=routing_energy,
-            count_global=count_global,
-            B=args.budget_B,
-            tau=args.tau,
-            eps=args.eps,
-        )
-        print(f"[INFO] selected_views={selected_views} budget_by_view={budget_by_view}")
+        print(f"[INFO] selected_views={selected_views}")
 
         if log_f is not None:
             log_row = {
@@ -1950,25 +1778,15 @@ def main():
                 "routing_probe_energy_view": energies_view,
                 "routing_energy_fused": routing_energy,
                 "selected_views": selected_views,
-                "budget_by_view": budget_by_view,
                 "count_doc_before": {k: int(v) for k, v in count_doc.items()},
                 "count_global_before": {k: int(v) for k, v in count_global.items()},
-                "routing_fuse_weights": {
-                    "route_weight": float(args.route_weight),
-                    "docchunk_energy_weight": float(args.docchunk_energy_weight),
-                    "view_energy_weight": float(args.view_energy_weight),
-                    "route_temperature": float(args.route_temperature),
-                },
             }
             log_f.write(json.dumps(log_row, ensure_ascii=False) + "\n")
             log_f.flush()
 
-        # update counts with actual budget (doc counts already +1 per view from selection)
         for v in selected_views:
             hist_view_selected[v] = hist_view_selected.get(v, 0) + 1
-            m_v = int(budget_by_view.get(v, 1))
-            count_global[v] = count_global.get(v, 0) + m_v
-            count_doc[v] = count_doc.get(v, 0) + max(0, m_v - 1)
+            count_global[v] = count_global.get(v, 0) + 1
 
         # --------- generate Q -> A sequentially (one QA per line) ---------
         seen_questions: List[str] = []
@@ -1976,9 +1794,8 @@ def main():
         view_to_questions: Dict[str, List[str]] = {}
         q_idx_global = 0  # question_idx within chunk across all views
         for vname in selected_views:
-            m_v = int(budget_by_view.get(vname, 1))
             questions: List[str] = []
-            for _ in range(m_v):
+            for _ in range(1):
                 question = ""
                 last_raw = ""
                 for attempt in range(args.m_retry + 1):
@@ -2026,7 +1843,7 @@ def main():
                     question = q
                     break
 
-                # If still invalid after retries, SKIP (enables true adaptivity: final count can be < budget)
+                # If still invalid after retries, skip this routed view.
                 if not question:
                     num_q_skipped += 1
                     continue

@@ -27,18 +27,6 @@ VIEW_DEFS: Dict[str, str] = {
     "quantitative": "Ask for numbers, metrics, time, stages, or other structured facts answerable from the Body.",
 }
 
-VIEW_MUTEX_GROUPS: Tuple[Tuple[str, ...], ...] = (
-    ("causation", "mechanism", "impact"),
-    ("concept", "condition"),
-)
-
-VIEW_SYNERGY_PAIRS: Tuple[Tuple[str, str], ...] = (
-    ("causation", "impact"),
-    ("mechanism", "impact"),
-    ("comparison", "quantitative"),
-    ("evidence", "concept"),
-)
-
 DEFAULT_MID_TOKEN = "<|MID|>"
 
 

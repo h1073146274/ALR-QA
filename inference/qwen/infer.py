@@ -521,8 +521,6 @@ def _build_question_prompt(ctx: Dict[str, Any], view_name: str, n_questions: int
                 number=1,
                 view=view_name,
                 existing_questions=existing_questions,
-                # v2 prompt: no JSON list output
-                strict_json=False,
             )
     if hasattr(PROMPTS, "build_question_generation_prompt"):
         # fallback (older VRQA prompt): still request 1 question
@@ -551,8 +549,7 @@ def _build_answer_prompt(ctx: Dict[str, Any], question: str) -> str:
                     "body": ctx["body"],
                 }
             )
-            # v2 prompt outputs ONE concise answer (no JSON arrays)
-            return fn(question=question, ctx=qa_ctx, n_answers=1, strict_json=False)
+            return fn(question=question, ctx=qa_ctx, n_answers=1)
     if hasattr(PROMPTS, "build_answer_generation_prompt"):
         return PROMPTS.build_answer_generation_prompt(
             question=question,
@@ -595,6 +592,7 @@ def _extract_json_array(text: str) -> List[str]:
 
 def _normalize_question(s: str) -> str:
     q = (s or "").strip()
+    q = re.sub(r"^(?:Question\s*:\s*|问题\s*[:：]\s*)", "", q, flags=re.IGNORECASE).strip()
     q = q.strip('"').strip("'").strip()
     return q
 

@@ -1055,7 +1055,7 @@ def main():
         jsonl_path=args.train_jsonl,
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
-        add_task_prefix=True,
+        add_task_prefix=False,
         pooling_mode=args.pooling_mode,
         mid_token=args.mid_token,
     )

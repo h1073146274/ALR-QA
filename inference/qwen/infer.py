@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NOTE: Universal MID (B-scheme): we add a dedicated <|MID|> token if missing and pool at its position.
+NOTE: Universal APT (B-scheme): we add a dedicated <|APT|> token if missing and pool at its position.
 generate_qa.py
 
 End-to-end QA synthesis using a trained dual-anchor soft-guidance generator:
-  1) Probe-based multi-view routing (MID lookahead) with coverage prior + greedy selection
+  1) Probe-based multi-view routing (APT lookahead) with coverage prior + greedy selection
   2) Question generation under selected views
   3) Answer generation grounded directly on the current chunk body
 
@@ -89,16 +89,16 @@ def _token_is_single_id(tokenizer: PreTrainedTokenizerBase, s: str) -> bool:
     return isinstance(ids, list) and len(ids) == 1
 
 
-def ensure_mid_token_and_resize(
+def ensure_apt_token_and_resize(
     tokenizer: PreTrainedTokenizerBase,
     model: nn.Module,
-    mid_token: str,
+    apt_token: str,
 ) -> int:
     """
     Universal B-scheme:
-      - Ensure `mid_token` exists in tokenizer AND maps to a single token id.
+      - Ensure `apt_token` exists in tokenizer AND maps to a single token id.
       - If not, add it as an additional special token, then resize model embeddings.
-    Returns: mid_token_id
+    Returns: apt_token_id
     """
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -116,21 +116,21 @@ def ensure_mid_token_and_resize(
             else:
                 model.resize_token_embeddings(target_vocab)
 
-    tid = tokenizer.convert_tokens_to_ids(mid_token)
-    ok_single = _token_is_single_id(tokenizer, mid_token)
+    tid = tokenizer.convert_tokens_to_ids(apt_token)
+    ok_single = _token_is_single_id(tokenizer, apt_token)
     if tid is None or tid == tokenizer.unk_token_id or not ok_single:
-        tokenizer.add_special_tokens({"additional_special_tokens": [mid_token]})
+        tokenizer.add_special_tokens({"additional_special_tokens": [apt_token]})
         _resize_to_tokenizer_len()
-        tid = tokenizer.convert_tokens_to_ids(mid_token)
-        if tid is None or tid == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, mid_token):
-            raise ValueError(f"Failed to install MID token '{mid_token}' as a single token id.")
+        tid = tokenizer.convert_tokens_to_ids(apt_token)
+        if tid is None or tid == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, apt_token):
+            raise ValueError(f"Failed to install APT token '{apt_token}' as a single token id.")
     else:
         _resize_to_tokenizer_len()
 
     if tokenizer.eos_token_id is not None and tid == tokenizer.eos_token_id:
-        raise ValueError(f"MID token '{mid_token}' resolves to eos_token_id={tid}. Choose another MID token.")
+        raise ValueError(f"APT token '{apt_token}' resolves to eos_token_id={tid}. Choose another APT token.")
     if tokenizer.pad_token_id is not None and tid == tokenizer.pad_token_id:
-        raise ValueError(f"MID token '{mid_token}' resolves to pad_token_id={tid}. Choose another MID token.")
+        raise ValueError(f"APT token '{apt_token}' resolves to pad_token_id={tid}. Choose another APT token.")
     return int(tid)
 
 
@@ -491,11 +491,11 @@ def _make_prompt_ctx(ctx: Dict[str, Any]):
         return ctx
 
 
-def _build_probe_prompt(ctx: Dict[str, Any], view_name: str, mid_token: str) -> str:
+def _build_probe_prompt(ctx: Dict[str, Any], view_name: str, apt_token: str) -> str:
     fn = getattr(PROMPTS, "build_question_probe_prompt")
     sig = inspect.signature(fn)
     if "ctx" in sig.parameters:
-        return fn(ctx=_make_prompt_ctx(ctx), view=view_name, mid_token=mid_token)
+        return fn(ctx=_make_prompt_ctx(ctx), view=view_name, apt_token=apt_token)
     # backward-compatible fallback
     return fn(
         article_summary=ctx["article_summary"],
@@ -505,7 +505,7 @@ def _build_probe_prompt(ctx: Dict[str, Any], view_name: str, mid_token: str) -> 
         body=ctx["body"],
         view_name=view_name,
         view_definition=VIEWS[view_name],
-        mid_token=mid_token,
+        apt_token=apt_token,
         title=ctx["title"],
     )
 
@@ -888,7 +888,7 @@ def compute_anchor_energy(
     prompt: str,
     view_name: str,
     view_to_id: Dict[str, int],
-    mid_token_id: int,
+    apt_token_id: int,
     a_doc: torch.Tensor,
     a_chunk: torch.Tensor,
     view_prototypes: Optional[torch.Tensor],
@@ -898,21 +898,21 @@ def compute_anchor_energy(
     device: torch.device,
 ) -> Tuple[float, float, float, Optional[float], Optional[float]]:
     """
-    Run a single forward pass on `prompt` and compute anchor energy at MID position.
+    Run a single forward pass on `prompt` and compute anchor energy at APT position.
     Energy definition matches training: sum_l (lambda_doc*(1-cos_doc) + lambda_chunk*(1-cos_chunk)).
     """
     enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = enc["input_ids"].to(device)
     attn = enc["attention_mask"].to(device)
 
-    # locate MID position (last occurrence)
+    # locate APT position (last occurrence)
     ids = input_ids[0].tolist()
     try:
-        mid_pos = len(ids) - 1 - ids[::-1].index(mid_token_id)
+        apt_pos = len(ids) - 1 - ids[::-1].index(apt_token_id)
     except ValueError:
-        raise ValueError("MID token id not found in prompt tokenization. Check --mid_token.")
+        raise ValueError("APT token id not found in prompt tokenization. Check --apt_token.")
 
-    hook.pool_idx = torch.tensor([mid_pos], device=device, dtype=torch.long)
+    hook.pool_idx = torch.tensor([apt_pos], device=device, dtype=torch.long)
     hook.clear()
     _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
 
@@ -967,7 +967,7 @@ def compute_anchor_energy_batch(
     prompts: List[str],
     view_names: List[str],
     view_to_id: Dict[str, int],
-    mid_token_id: int,
+    apt_token_id: int,
     a_doc: torch.Tensor,
     a_chunk: torch.Tensor,
     view_prototypes: Optional[torch.Tensor],
@@ -985,16 +985,16 @@ def compute_anchor_energy_batch(
     input_ids = enc["input_ids"].to(device)
     attn = enc["attention_mask"].to(device)
 
-    # locate MID position per row (last occurrence)
+    # locate APT position per row (last occurrence)
     ids = input_ids.tolist()
-    mid_pos = []
+    apt_pos = []
     for row in ids:
         try:
-            mid_pos.append(len(row) - 1 - row[::-1].index(mid_token_id))
+            apt_pos.append(len(row) - 1 - row[::-1].index(apt_token_id))
         except ValueError:
-            raise ValueError("MID token id not found in prompt tokenization. Check --mid_token.")
+            raise ValueError("APT token id not found in prompt tokenization. Check --apt_token.")
 
-    hook.pool_idx = torch.tensor(mid_pos, device=device, dtype=torch.long)
+    hook.pool_idx = torch.tensor(apt_pos, device=device, dtype=torch.long)
     hook.clear()
     _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
 
@@ -1412,19 +1412,13 @@ def main():
     ap.add_argument("--trace_include_prompts", action="store_true", help="Include prompts in trace_jsonl (large)")
 
     # Routing
-    ap.add_argument("--K", type=int, default=2, help="number of views per chunk")
-    ap.add_argument("--mid_token", type=str, default="<|MID|>", help="Dedicated MID token inserted before ### Response.")
-    ap.add_argument(
-        "--ensure_mid_token",
-        action="store_true",
-        default=True,
-        help="Auto-add MID token to tokenizer and resize embeddings if missing.",
-    )
+    ap.add_argument("--K", type=int, default=3, help="number of views per chunk")
+    ap.add_argument("--apt_token", type=str, default="<|APT|>", help="Dedicated APT token inserted before ### Response.")
 
     # Generation
     ap.add_argument("--m_retry", type=int, default=1, help="question retry times if bad/duplicate")
-    ap.add_argument("--q_max_new_tokens", type=int, default=64)
-    ap.add_argument("--a_max_new_tokens", type=int, default=64)
+    ap.add_argument("--q_max_new_tokens", type=int, default=256)
+    ap.add_argument("--a_max_new_tokens", type=int, default=512)
     ap.add_argument("--temperature_q", type=float, default=0.7)
     # For answers, default deterministic decoding to avoid verbose / drifting outputs.
     ap.add_argument("--temperature_a", type=float, default=0.0)
@@ -1499,15 +1493,8 @@ def main():
         device_map=None,
     ).to(device)
 
-    # Ensure MID token exists (B-scheme) + resize if needed (before PEFT)
-    if args.ensure_mid_token:
-        mid_token_id = ensure_mid_token_and_resize(tok, base, args.mid_token)
-    else:
-        mid_token_id = tok.convert_tokens_to_ids(args.mid_token)
-        if mid_token_id is None or mid_token_id == tok.unk_token_id:
-            raise ValueError(f"MID token '{args.mid_token}' is unknown; enable --ensure_mid_token or pass a valid token.")
-
-    print(f"[INFO] Using MID token: {args.mid_token} (id={mid_token_id})")
+    apt_token_id = ensure_apt_token_and_resize(tok, base, args.apt_token)
+    print(f"[INFO] Using APT token: {args.apt_token} (id={apt_token_id})")
 
     model = PeftModel.from_pretrained(base, args.lora_dir).to(device)
     model.eval()
@@ -1684,7 +1671,7 @@ def main():
             _build_probe_prompt(
                 ctx=ctx,
                 view_name=vname,
-                mid_token=args.mid_token,
+                apt_token=args.apt_token,
             )
             for vname in view_names
         ]
@@ -1703,7 +1690,7 @@ def main():
                     prompts=probe_prompts,
                     view_names=view_names,
                     view_to_id=view_to_id,
-                    mid_token_id=mid_token_id,
+                    apt_token_id=apt_token_id,
                     a_doc=a_doc,
                     a_chunk=a_chunk,
                     view_prototypes=view_prototypes,
@@ -1732,7 +1719,7 @@ def main():
                     prompt=pp,
                     view_name=vname,
                     view_to_id=view_to_id,
-                    mid_token_id=mid_token_id,
+                    apt_token_id=apt_token_id,
                     a_doc=a_doc,
                     a_chunk=a_chunk,
                     view_prototypes=view_prototypes,
@@ -1809,7 +1796,7 @@ def main():
                         prompt=q_prompt,
                         device=device,
                         max_new_tokens=args.q_max_new_tokens,
-                        temperature=args.temperature_q if attempt == 0 else max(0.2, args.temperature_q * 0.7),
+                        temperature=args.temperature_q,
                         top_p=args.top_p,
                         repetition_penalty=args.repetition_penalty,
                         do_sample=True,
@@ -1898,7 +1885,7 @@ def main():
                         tokenizer=tok,
                         prompt=a_prompt,
                         device=device,
-                        max_new_tokens=min(24, args.a_max_new_tokens),
+                        max_new_tokens=args.a_max_new_tokens,
                         temperature=0.0,
                         top_p=1.0,
                         repetition_penalty=args.a_repetition_penalty,

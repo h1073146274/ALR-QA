@@ -247,14 +247,16 @@ def main() -> None:
         views = selected.get("views", []) if isinstance(selected, dict) else selected
         if not isinstance(views, list):
             views = []
+        existing_questions: list[str] = []
         for view in views[: args.k]:
             view = str(view or "").strip()
             if not view:
                 continue
-            q_prompt = build_teacher_question_prompt(view=view, chunk_text=body)
+            q_prompt = build_teacher_question_prompt(view=view, chunk_text=body, existing_questions=existing_questions)
             question = strip_labeled_text(chat_text(client, args.model, q_prompt, args.temperature, args.retries), "Question")
             if not question:
                 continue
+            existing_questions.append(question)
             a_prompt = build_teacher_answer_prompt(view=view, question=question, chunk_text=body)
             answer = strip_labeled_text(chat_text(client, args.model, a_prompt, args.temperature, args.retries), "Answer")
             if not answer:

@@ -24,12 +24,25 @@ require_var() {
 }
 
 split_chunks() {
-  require_var CHUNK_JSONL
+  require_var DOCUMENT_JSONL
   require_var SPLIT_OUT_DIR
+  require_var CORPUS_NAME
+  require_var TOKENIZER_NAME_OR_PATH
+  require_var MIN_CHUNK_TOKENS
+  require_var MAX_CHUNK_TOKENS
+  require_var CHUNK_OVERLAP_TOKENS
+  require_var SAMPLE_DOCS
+  require_var SPLIT_SEED
   "${PYTHON_BIN}" "${ROOT}/scripts/split_chunks.py" \
-    --input "${CHUNK_JSONL}" \
+    --input "${DOCUMENT_JSONL}" \
     --out_dir "${SPLIT_OUT_DIR}" \
-    --name "${CORPUS_NAME:-}"
+    --name "${CORPUS_NAME}" \
+    --tokenizer_name_or_path "${TOKENIZER_NAME_OR_PATH}" \
+    --min_tokens "${MIN_CHUNK_TOKENS}" \
+    --max_tokens "${MAX_CHUNK_TOKENS}" \
+    --overlap_tokens "${CHUNK_OVERLAP_TOKENS}" \
+    --sample_docs "${SAMPLE_DOCS}" \
+    --seed "${SPLIT_SEED}"
 }
 
 build_dataset() {
@@ -80,6 +93,14 @@ train_model() {
   if [[ "${ARCH}" == "phi" ]]; then
     TRAIN_ENTRY="${ROOT}/train/phi/train.py"
   fi
+  local learning_rate="${LR:-}"
+  if [[ -z "${learning_rate}" ]]; then
+    if [[ "${ARCH}" == "phi" ]]; then
+      learning_rate="5e-5"
+    else
+      learning_rate="1e-4"
+    fi
+  fi
   "${PYTHON_BIN}" "${TRAIN_ENTRY}" \
     --model_name_or_path "${BASE_MODEL}" \
     --train_jsonl "${train_jsonl}" \
@@ -88,14 +109,12 @@ train_model() {
     --view_anchor_pt "${VIEW_ANCHOR:-}" \
     --output_dir "${OUTPUT_DIR}" \
     --max_seq_len "${MAX_SEQ_LEN:-2048}" \
-    --pooling_mode mid \
-    --mid_token "<|MID|>" \
-    --ensure_mid_token \
+    --apt_token "<|APT|>" \
     --per_device_train_batch_size "${BATCH:-1}" \
-    --gradient_accumulation_steps "${GAS:-16}" \
-    --num_train_epochs "${EPOCHS:-2}" \
+    --gradient_accumulation_steps "${GAS:-8}" \
+    --num_train_epochs "${EPOCHS:-3}" \
     --max_steps "${MAX_STEPS:--1}" \
-    --learning_rate "${LR:-2e-4}" \
+    --learning_rate "${learning_rate}" \
     --alpha "${ALPHA:-0.08}" \
     --beta_route "${BETA_ROUTE:-0.05}" \
     --delta_vgc "${DELTA_VGC:-0.05}" \

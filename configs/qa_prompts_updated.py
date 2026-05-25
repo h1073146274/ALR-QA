@@ -27,7 +27,7 @@ VIEW_DEFS: Dict[str, str] = {
     "quantitative": "Ask for numbers, metrics, time, stages, or other structured facts answerable from the Body.",
 }
 
-DEFAULT_MID_TOKEN = "<|MID|>"
+DEFAULT_APT_TOKEN = "<|APT|>"
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,7 @@ def build_question_probe_prompt(
     view_name: Optional[str] = None,
     view_definition: Optional[str] = None,
     view: Optional[str] = None,
-    mid_token: Optional[str] = DEFAULT_MID_TOKEN,
+    apt_token: Optional[str] = DEFAULT_APT_TOKEN,
     title: str = "",
     add_task_prefix: bool = True,
     minimal_context: bool = False,
@@ -104,7 +104,7 @@ def build_question_probe_prompt(
         + "Do not generate the question yet; use the special token as the routing position.\n\n"
         + f"[View]\nname: {eff_view}\ninstruction: {eff_def}\n\n"
         + _context_blocks(ctx, include_anchors=not minimal_context)
-        + f"\n\n{mid_token}"
+        + f"\n\n{apt_token}"
         + _response_header()
     )
 
@@ -258,11 +258,11 @@ def build_view_selection_prompt(
     )
 
 
-def build_teacher_question_prompt(*, view: str, chunk_text: str) -> str:
+def build_teacher_question_prompt(*, view: str, chunk_text: str, existing_questions: Optional[Sequence[str]] = None) -> str:
     return build_question_prompt_sft(
         ctx=QAContext(body=chunk_text),
         view=view,
-        existing_questions=[],
+        existing_questions=existing_questions,
     )
 
 

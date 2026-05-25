@@ -193,10 +193,10 @@ def assert_trainable_parameters_finite(model: nn.Module, where: str) -> None:
         raise FloatingPointError(f"Non-finite trainable parameters at {where}: " + "; ".join(bad))
 
 
-def ensure_mid_token_and_resize(
+def ensure_apt_token_and_resize(
     tokenizer: PreTrainedTokenizerBase,
     model: nn.Module,
-    mid_token: str,
+    apt_token: str,
 ) -> int:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -213,21 +213,21 @@ def ensure_mid_token_and_resize(
                 "Phi models may reserve extra embedding rows, so training should not shrink them."
             )
 
-    tid = tokenizer.convert_tokens_to_ids(mid_token)
-    ok_single = _token_is_single_id(tokenizer, mid_token)
+    tid = tokenizer.convert_tokens_to_ids(apt_token)
+    ok_single = _token_is_single_id(tokenizer, apt_token)
     if tid is None or tid == tokenizer.unk_token_id or not ok_single:
-        tokenizer.add_special_tokens({"additional_special_tokens": [mid_token]})
+        tokenizer.add_special_tokens({"additional_special_tokens": [apt_token]})
         _resize_only_if_needed()
-        tid = tokenizer.convert_tokens_to_ids(mid_token)
-        if tid is None or tid == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, mid_token):
-            raise ValueError(f"Failed to install MID token '{mid_token}' as a single token id.")
+        tid = tokenizer.convert_tokens_to_ids(apt_token)
+        if tid is None or tid == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, apt_token):
+            raise ValueError(f"Failed to install APT token '{apt_token}' as a single token id.")
     else:
         _resize_only_if_needed()
 
     if tokenizer.eos_token_id is not None and tid == tokenizer.eos_token_id:
-        raise ValueError(f"MID token '{mid_token}' resolves to eos_token_id={tid}.")
+        raise ValueError(f"APT token '{apt_token}' resolves to eos_token_id={tid}.")
     if tokenizer.pad_token_id is not None and tid == tokenizer.pad_token_id:
-        raise ValueError(f"MID token '{mid_token}' resolves to pad_token_id={tid}.")
+        raise ValueError(f"APT token '{apt_token}' resolves to pad_token_id={tid}.")
     return int(tid)
 
 
@@ -359,34 +359,6 @@ def build_view_prototypes_from_jsonl(
     return F.normalize(protos, p=2, dim=-1)
 
 
-def last_label_index(labels: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    B, T = labels.shape
-    idx = torch.full((B,), T - 1, device=labels.device, dtype=torch.long)
-
-    for b in range(B):
-        pos = torch.where(labels[b] != -100)[0]
-        if len(pos) > 0:
-            idx[b] = pos[-1]
-        else:
-            pos2 = torch.where(attention_mask[b] == 1)[0]
-            idx[b] = pos2[-1] if len(pos2) > 0 else T - 1
-    return idx
-
-
-def prompt_end_index(labels: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    B, T = labels.shape
-    idx = torch.full((B,), T - 1, device=labels.device, dtype=torch.long)
-
-    for b in range(B):
-        pos = torch.where(labels[b] != -100)[0]
-        if len(pos) > 0:
-            idx[b] = max(int(pos[0]) - 1, 0)
-        else:
-            pos2 = torch.where(attention_mask[b] == 1)[0]
-            idx[b] = pos2[-1] if len(pos2) > 0 else T - 1
-    return idx
-
-
 # -------------------------
 # Dataset & Collator
 # -------------------------
@@ -397,15 +369,13 @@ class JSONLSFTDataset(Dataset):
         tokenizer,
         max_seq_len: int,
         add_task_prefix: bool = True,
-        pooling_mode: str = "mid",
-        mid_token: str = "<|MID|>",
+        apt_token: str = "<|APT|>",
     ):
         self.jsonl_path = jsonl_path
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.add_task_prefix = add_task_prefix
-        self.pooling_mode = str(pooling_mode)
-        self.mid_token = str(mid_token)
+        self.apt_token = str(apt_token)
 
         self.rows = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -449,10 +419,7 @@ class JSONLSFTDataset(Dataset):
         if self.add_task_prefix and task:
             task_line = f"Task: {task}\n"
 
-        if self.pooling_mode == "mid":
-            prompt_text = f"{task_line}{prompt.strip()}\n{self.mid_token}\n\n### Response:\n"
-        else:
-            prompt_text = f"{task_line}{prompt.strip()}\n\n### Response:\n"
+        prompt_text = f"{task_line}{prompt.strip()}\n{self.apt_token}\n\n### Response:\n"
         resp_text = response.strip()
         return prompt_text, resp_text
 
@@ -574,8 +541,7 @@ class DualAnchorTrainer(Trainer):
         lambda_doc: List[float],
         lambda_chunk: List[float],
         lambda_view: Optional[List[float]] = None,
-        pooling_mode: str = "prompt_end",
-        mid_token_id: Optional[int] = None,
+        apt_token_id: int,
         **kwargs,
     ):
         self._tok = kwargs.pop("tokenizer", None)
@@ -593,8 +559,7 @@ class DualAnchorTrainer(Trainer):
         self.lambda_view = lambda_view
         self.use_view_anchor = self.view_anchor_emb is not None and self.lambda_view is not None
 
-        self.pooling_mode = str(pooling_mode)
-        self.mid_token_id = int(mid_token_id) if mid_token_id is not None else None
+        self.apt_token_id = int(apt_token_id)
 
         self._last_custom_metrics: Dict[str, float] = {}
 
@@ -734,25 +699,19 @@ class DualAnchorTrainer(Trainer):
         view_id = inputs.pop("view_id", None)
         observed_view_mask = inputs.pop("observed_view_mask", None)
         labels = inputs.get("labels")
-        attention_mask = inputs.get("attention_mask")
 
         device = labels.device
         a_doc, a_chunk, a_view = self._get_anchors(anchor_row_idx, device=device)
 
-        if self.pooling_mode == "mid":
-            if self.mid_token_id is None:
-                raise ValueError("pooling_mode=mid requires mid_token_id to be set in DualAnchorTrainer.")
-            input_ids = inputs["input_ids"]
-            B, _T = input_ids.shape
-            pool_idx = torch.empty((B,), device=input_ids.device, dtype=torch.long)
-            for b in range(B):
-                row = input_ids[b].tolist()
-                try:
-                    pool_idx[b] = len(row) - 1 - row[::-1].index(self.mid_token_id)
-                except ValueError:
-                    pool_idx[b] = prompt_end_index(labels, attention_mask)[b]
-        else:
-            pool_idx = prompt_end_index(labels, attention_mask)
+        input_ids = inputs["input_ids"]
+        B, _T = input_ids.shape
+        pool_idx = torch.empty((B,), device=input_ids.device, dtype=torch.long)
+        for b in range(B):
+            row = input_ids[b].tolist()
+            try:
+                pool_idx[b] = len(row) - 1 - row[::-1].index(self.apt_token_id)
+            except ValueError as exc:
+                raise ValueError("APT token id not found in training input.") from exc
         self._hook.pool_idx = pool_idx
         self._hook.clear()
 
@@ -877,9 +836,9 @@ def main():
     # training
     ap.add_argument("--max_seq_len", type=int, default=2048)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=16)
-    ap.add_argument("--num_train_epochs", type=int, default=2)
-    ap.add_argument("--learning_rate", type=float, default=2e-4)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    ap.add_argument("--num_train_epochs", type=int, default=3)
+    ap.add_argument("--learning_rate", type=float, default=5e-5)
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--logging_steps", type=int, default=10)
@@ -919,21 +878,7 @@ def main():
     ap.add_argument("--beta_route", type=float, default=0.05, help="weight for routing BCE loss")
     ap.add_argument("--delta_vgc", type=float, default=0.05, help="weight for view-geometry consistency loss")
 
-    # pooling alignment (Scheme B)
-    ap.add_argument(
-        "--pooling_mode",
-        type=str,
-        default="mid",
-        choices=["prompt_end", "mid"],
-        help="Where to pool hidden states for anchor guidance. 'mid' pools at a dedicated MID token inserted before ### Response.",
-    )
-    ap.add_argument("--mid_token", type=str, default="<|MID|>", help="Dedicated MID token used when pooling_mode=mid")
-    ap.add_argument(
-        "--ensure_mid_token",
-        action="store_true",
-        default=True,
-        help="Auto-add MID token to tokenizer and resize embeddings if missing.",
-    )
+    ap.add_argument("--apt_token", type=str, default="<|APT|>", help="Dedicated APT token inserted before ### Response.")
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -968,14 +913,7 @@ def main():
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
-    mid_token_id = None
-    if args.pooling_mode == "mid":
-        if args.ensure_mid_token:
-            mid_token_id = ensure_mid_token_and_resize(tokenizer, model, args.mid_token)
-        else:
-            mid_token_id = tokenizer.convert_tokens_to_ids(args.mid_token)
-            if mid_token_id is None or mid_token_id == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, args.mid_token):
-                raise ValueError("MID token missing or not a single token id. Enable --ensure_mid_token.")
+    apt_token_id = ensure_apt_token_and_resize(tokenizer, model, args.apt_token)
 
     # load anchor embeddings (CPU)
     doc_anchor = torch.load(args.doc_anchor_pt, map_location="cpu")
@@ -1056,8 +994,7 @@ def main():
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
         add_task_prefix=False,
-        pooling_mode=args.pooling_mode,
-        mid_token=args.mid_token,
+        apt_token=args.apt_token,
     )
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
@@ -1101,8 +1038,7 @@ def main():
         lambda_doc=lambda_doc,
         lambda_chunk=lambda_chunk,
         lambda_view=lambda_view,
-        pooling_mode=args.pooling_mode,
-        mid_token_id=mid_token_id,
+        apt_token_id=apt_token_id,
         tokenizer=tokenizer,
     )
 

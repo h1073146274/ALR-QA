@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import argparse
 import json
@@ -25,9 +24,7 @@ from transformers import (
 
 from peft import LoraConfig, get_peft_model
 
-# -------------------------
-# View taxonomy (Bloom-inspired information-function taxonomy, fixed 8)
-# -------------------------
+
 VIEW_NAMES: List[str] = [
     "concept",
     "mechanism",
@@ -45,25 +42,20 @@ def normalize_view_name(view: str) -> str:
     return str(view or "").strip().lower()
 
 
-# -------------------------
-# Utilities
-# -------------------------
 import torch.nn as nn
 
 def _unwrap_base_model(model: nn.Module) -> nn.Module:
-    """
-    Unwrap PEFT model to the underlying HF model if needed.
-    """
-    # PEFT >= 0.10 usually has get_base_model()
+
+
     if hasattr(model, "get_base_model"):
         try:
             return model.get_base_model()
         except Exception:
             pass
-    # common PEFT wrapper fields
+
     if hasattr(model, "base_model"):
         bm = model.base_model
-        # sometimes bm has .model
+
         if hasattr(bm, "model"):
             return bm.model
         return bm
@@ -80,12 +72,7 @@ def ensure_apt_token_and_resize(
     model: nn.Module,
     apt_token: str,
 ) -> int:
-    """
-    Universal B-scheme for training:
-      - Ensure `apt_token` exists AND is a single token id
-      - If not, add as additional_special_tokens, resize model embeddings
-    Returns apt_token_id
-    """
+
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -111,14 +98,11 @@ def ensure_apt_token_and_resize(
 
 
 def find_transformer_layers(model: nn.Module):
-    """
-    Robustly locate decoder block list (ModuleList) by scanning the model.
-    Works for Qwen/LLaMA/GPT-style and PEFT-wrapped models.
-    """
+
     base = _unwrap_base_model(model)
     cfg = getattr(base, "config", None)
 
-    # number of layers in config (different naming across models)
+
     num_layers = None
     for k in ["num_hidden_layers", "n_layer", "num_layers", "n_layers"]:
         if cfg is not None and hasattr(cfg, k):
@@ -128,7 +112,7 @@ def find_transformer_layers(model: nn.Module):
         raise ValueError("Cannot infer num_layers from config. Please print base.config and adapt.")
 
     candidates = []
-    # scan all submodules, pick ModuleList with matching length
+
     for name, mod in base.named_modules():
         if isinstance(mod, nn.ModuleList) and len(mod) == num_layers:
             candidates.append((name, mod))
@@ -138,14 +122,14 @@ def find_transformer_layers(model: nn.Module):
             f"Cannot locate transformer layers: no nn.ModuleList with length={num_layers} found."
         )
 
-    # choose the most likely one: whose elements look like decoder layers
+
     def score(modlist: nn.ModuleList) -> int:
         m0 = modlist[0]
         s = 0
         for attr in ["self_attn", "attn", "mlp", "feed_forward", "input_layernorm", "post_attention_layernorm"]:
             if hasattr(m0, attr):
                 s += 1
-        # also favor typical class name hints
+
         cn = m0.__class__.__name__.lower()
         if "decoder" in cn or "layer" in cn or "block" in cn:
             s += 2
@@ -160,7 +144,6 @@ def find_transformer_layers(model: nn.Module):
     return list(best_list)
 
 
-
 def pick_layers(num_layers: int) -> List[int]:
     if num_layers <= 0:
         raise ValueError("num_layers must be > 0")
@@ -168,30 +151,22 @@ def pick_layers(num_layers: int) -> List[int]:
 
 
 def make_layer_weights(k: int) -> Tuple[List[float], List[float]]:
-    """
-    Make doc/chunk weights for k selected layers.
-    Doc decreases, chunk increases.
-    For k=4 -> doc: [1.0,0.7,0.4,0.2], chunk: [0.2,0.4,0.7,1.0]
-    Otherwise do linear interpolation.
-    """
+
     if k == 4:
         return [1.0, 0.7, 0.4, 0.2], [0.2, 0.4, 0.7, 1.0]
-    # linear schedule
+
     doc = []
     chunk = []
     for i in range(k):
         t = i / max(k - 1, 1)
-        # doc: 1 -> 0.2, chunk: 0.2 -> 1
+
         doc.append(1.0 * (1 - t) + 0.2 * t)
         chunk.append(0.2 * (1 - t) + 1.0 * t)
     return doc, chunk
 
 
 def make_view_layer_weights(lambda_chunk: List[float], view_lambda_scale: float) -> List[float]:
-    """
-    Make view weights from chunk schedule.
-    By default, view follows deeper-layer preference similar to chunk.
-    """
+
     s = float(view_lambda_scale)
     return [s * w for w in lambda_chunk]
 
@@ -213,11 +188,7 @@ def build_view_prototypes_from_jsonl(
     jsonl_paths: List[str],
     view_anchor: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """
-    Build one prototype per view by averaging row-level view anchors grouped by
-    the row's `view` label. This keeps router-energy alignment in the same
-    anchor space without requiring QA scores.
-    """
+
     if view_anchor is None:
         return None
     if len(view_anchor.shape) != 2:
@@ -259,9 +230,6 @@ def build_view_prototypes_from_jsonl(
     return F.normalize(protos, p=2, dim=-1)
 
 
-# -------------------------
-# Dataset & Collator
-# -------------------------
 class JSONLSFTDataset(Dataset):
     def __init__(
         self,
@@ -285,7 +253,7 @@ class JSONLSFTDataset(Dataset):
                     continue
                 self.rows.append(json.loads(line))
 
-        # Build chunk-level observed-view sets for weak multi-positive routing.
+
         self._row_chunk_id: List[str] = []
         self._row_view_id: List[int] = []
         chunk_to_views: Dict[str, set] = {}
@@ -306,7 +274,7 @@ class JSONLSFTDataset(Dataset):
                     mask[vid] = 1
             self._row_observed_view_mask.append(mask)
 
-        # Tokenizer padding side is relevant for collator; we do truncation in __getitem__.
+
         self.tokenizer.padding_side = "right"
 
     def __len__(self):
@@ -332,10 +300,10 @@ class JSONLSFTDataset(Dataset):
         prompt_text, resp_text = self._format_pair(r)
         anchor_row_idx = r.get("anchor_row_idx", r.get("anchor_row", r.get("anchor_idx", None)))
         if anchor_row_idx is None:
-            # If you didn't write indexed jsonl, fallback: use dataset line id
+
             anchor_row_idx = row_idx
 
-        # Tokenize prompt/response separately to keep label masking correct under truncation
+
         tok_prompt = self.tokenizer(prompt_text, add_special_tokens=False, return_tensors=None)
         tok_resp = self.tokenizer(resp_text, add_special_tokens=False, return_tensors=None)
         prompt_ids = tok_prompt["input_ids"]
@@ -413,9 +381,6 @@ class DataCollatorWithPadding:
         return batch
 
 
-# -------------------------
-# Hook: store pooled z^l only (B x H)
-# -------------------------
 class PooledLayerHook:
     SKIP_DURING_EXTERNAL_FORWARD = False
 
@@ -423,7 +388,7 @@ class PooledLayerHook:
         self.layers = layers
         self.layer_ids = layer_ids
         self.handles = []
-        self.pool_idx: Optional[torch.Tensor] = None  # [B]
+        self.pool_idx: Optional[torch.Tensor] = None
         self.cache: Dict[int, torch.Tensor] = {}
 
     def clear(self):
@@ -433,11 +398,11 @@ class PooledLayerHook:
         def hook_fn(module, inp, out):
             if PooledLayerHook.SKIP_DURING_EXTERNAL_FORWARD:
                 return
-            hs = out[0] if isinstance(out, (tuple, list)) else out  # [B,T,H]
+            hs = out[0] if isinstance(out, (tuple, list)) else out
             assert self.pool_idx is not None, "pool_idx must be set before forward."
             B = hs.size(0)
-            idx = self.pool_idx  # [B]
-            z = hs[torch.arange(B, device=hs.device), idx]  # [B,H]
+            idx = self.pool_idx
+            z = hs[torch.arange(B, device=hs.device), idx]
             self.cache[layer_id] = z
         return hook_fn
 
@@ -452,9 +417,6 @@ class PooledLayerHook:
         self.handles = []
 
 
-# -------------------------
-# Custom Trainer
-# -------------------------
 class DualAnchorTrainer(Trainer):
     def __init__(
         self,
@@ -473,9 +435,9 @@ class DualAnchorTrainer(Trainer):
         apt_token_id: int,
         **kwargs,
     ):
-        self._tok = kwargs.pop("tokenizer", None) 
+        self._tok = kwargs.pop("tokenizer", None)
         super().__init__(*args, **kwargs)
-        self.doc_anchor_emb = doc_anchor_emb  # [N, D_anchor] on CPU
+        self.doc_anchor_emb = doc_anchor_emb
         self.chunk_anchor_emb = chunk_anchor_emb
         self.view_anchor_emb = view_anchor_emb
         self.view_prototypes = view_prototypes
@@ -490,16 +452,16 @@ class DualAnchorTrainer(Trainer):
 
         self.apt_token_id = int(apt_token_id)
 
-        # cached metrics merged into logs
+
         self._last_custom_metrics: Dict[str, float] = {}
 
-        # setup hooks
+
         self._layers = find_transformer_layers(self.model)
         self._hook = PooledLayerHook(self._layers, self.layer_ids)
         self._hook.register()
 
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
-        # merge last custom metrics for tensorboard/console
+
         if self._last_custom_metrics:
             logs = dict(logs)
             for k, v in self._last_custom_metrics.items():
@@ -513,7 +475,7 @@ class DualAnchorTrainer(Trainer):
         anchor_row_idx: torch.Tensor,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        # anchor_row_idx: [B]
+
         a_doc = self.doc_anchor_emb.index_select(0, anchor_row_idx.cpu()).to(device=device, dtype=torch.float32)
         a_chunk = self.chunk_anchor_emb.index_select(0, anchor_row_idx.cpu()).to(device=device, dtype=torch.float32)
         a_view = None
@@ -523,18 +485,16 @@ class DualAnchorTrainer(Trainer):
 
     def _anchor_loss(
         self,
-        zs: List[torch.Tensor],   # list of [B,H] in same order as layer_ids
-        a_doc: torch.Tensor,      # [B,D_anchor]
-        a_chunk: torch.Tensor,    # [B,D_anchor]
-        a_view: Optional[torch.Tensor] = None,  # [B,D_anchor]
+        zs: List[torch.Tensor],
+        a_doc: torch.Tensor,
+        a_chunk: torch.Tensor,
+        a_view: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        zs in H-space; projection to anchor space inside.
-        """
+
         device = zs[0].device
         B = zs[0].size(0)
 
-        # project z -> anchor dim
+
         base = _unwrap_base_model(self.model)
         proj_doc: nn.Module = getattr(base, "anchor_proj_doc")
         proj_chunk: nn.Module = getattr(base, "anchor_proj_chunk")
@@ -544,11 +504,11 @@ class DualAnchorTrainer(Trainer):
 
         metrics: Dict[str, float] = {}
 
-        # anchor in projected space
+
         for i, z in enumerate(zs):
-            zf = z.float()  # [B,H]
-            z_doc = proj_doc(zf)      # [B,D_anchor]
-            z_chunk = proj_chunk(zf)  # [B,D_anchor]
+            zf = z.float()
+            z_doc = proj_doc(zf)
+            z_chunk = proj_chunk(zf)
             z_view = proj_view(zf) if (proj_view is not None and a_view is not None) else None
 
             z_doc = F.normalize(z_doc, p=2, dim=-1)
@@ -556,16 +516,16 @@ class DualAnchorTrainer(Trainer):
             if z_view is not None:
                 z_view = F.normalize(z_view, p=2, dim=-1)
 
-            # anchors already normalized offline; still safe to normalize
+
             a_doc_n = F.normalize(a_doc, p=2, dim=-1)
             a_chunk_n = F.normalize(a_chunk, p=2, dim=-1)
             a_view_n = F.normalize(a_view, p=2, dim=-1) if a_view is not None else None
 
-            cos_doc = (z_doc * a_doc_n).sum(dim=-1)      # [B]
+            cos_doc = (z_doc * a_doc_n).sum(dim=-1)
             cos_chunk = (z_chunk * a_chunk_n).sum(dim=-1)
             cos_view = (z_view * a_view_n).sum(dim=-1) if (z_view is not None and a_view_n is not None) else None
 
-            # energy = 1 - cos (more intuitive)
+
             e_doc = (1.0 - cos_doc).mean()
             e_chunk = (1.0 - cos_chunk).mean()
             e_view = (1.0 - cos_view).mean() if cos_view is not None else None
@@ -575,7 +535,7 @@ class DualAnchorTrainer(Trainer):
                 term = term + self.lambda_view[i] * e_view
             loss_anchor = loss_anchor + term
 
-            # log per-layer cos (higher is better)
+
             lid = self.layer_ids[i]
             metrics[f"cos_doc_L{lid}"] = float(cos_doc.mean().detach().cpu())
             metrics[f"cos_chunk_L{lid}"] = float(cos_chunk.mean().detach().cpu())
@@ -587,16 +547,12 @@ class DualAnchorTrainer(Trainer):
 
     def _compute_router_losses(
         self,
-        zs: List[torch.Tensor],                # list of [B,H]
-        observed_view_mask: Optional[torch.Tensor],  # [B,V]
+        zs: List[torch.Tensor],
+        observed_view_mask: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float], Optional[torch.Tensor]]:
-        """
-        Router losses without QA scores:
-          1) multi-label BCE over the observed view set per chunk
-          2) alignment between router distribution and view-energy-induced distribution
-        """
+
         device = zs[-1].device
-        z_route = zs[-1].float()  # use deepest pooled state as routing state
+        z_route = zs[-1].float()
         base = _unwrap_base_model(self.model)
         proj_route: Optional[nn.Module] = getattr(base, "anchor_proj_route", None)
         proj_view: Optional[nn.Module] = getattr(base, "anchor_proj_view", None)
@@ -608,10 +564,10 @@ class DualAnchorTrainer(Trainer):
             metrics["loss_vgc"] = 0.0
             return zero, zero, metrics, None
 
-        route_logits = proj_route(z_route)  # [B,V]
+        route_logits = proj_route(z_route)
         vdim = int(route_logits.size(-1))
 
-        # Multi-label routing supervision from observed view set S(c).
+
         loss_route = zero
         if observed_view_mask is not None and observed_view_mask.numel() > 0:
             mask = observed_view_mask.to(device=device, dtype=torch.float32)
@@ -622,15 +578,15 @@ class DualAnchorTrainer(Trainer):
             if valid.any():
                 loss_route = F.binary_cross_entropy_with_logits(route_logits[valid], mask[valid], reduction="mean")
 
-        # Align router distribution to geometry-induced view energy distribution.
+
         loss_vgc = zero
         if self.delta_vgc > 0 and proj_view is not None and self.view_prototypes is not None:
-            proto = self.view_prototypes.to(device=device, dtype=torch.float32)  # [V,D]
+            proto = self.view_prototypes.to(device=device, dtype=torch.float32)
             if proto.size(0) != vdim:
                 raise ValueError(f"view_prototypes V={proto.size(0)} != route dim {vdim}")
-            z_view = F.normalize(proj_view(z_route), p=2, dim=-1)               # [B,D]
-            proto_n = F.normalize(proto, p=2, dim=-1)                           # [V,D]
-            cos = torch.matmul(z_view, proto_n.t())                             # [B,V]
+            z_view = F.normalize(proj_view(z_route), p=2, dim=-1)
+            proto_n = F.normalize(proto, p=2, dim=-1)
+            cos = torch.matmul(z_view, proto_n.t())
             tgt = F.softmax(cos, dim=-1).detach()
             log_p = F.log_softmax(route_logits, dim=-1)
             loss_vgc = F.kl_div(log_p, tgt, reduction="batchmean")
@@ -643,13 +599,7 @@ class DualAnchorTrainer(Trainer):
         return loss_route, loss_vgc, metrics, route_logits
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """
-        Total loss:
-          L = L_lm
-            + alpha * L_anchor
-            + beta_route * L_route
-            + delta_vgc * L_vgc
-        """
+
         anchor_row_idx = inputs.pop("anchor_row_idx")
         view_id = inputs.pop("view_id", None)
         observed_view_mask = inputs.pop("observed_view_mask", None)
@@ -670,16 +620,16 @@ class DualAnchorTrainer(Trainer):
         self._hook.pool_idx = pool_idx
         self._hook.clear()
 
-        # clean forward
+
         outputs = model(**inputs, use_cache=False)
         lm_loss = outputs.loss
 
-        # gather pooled z for selected layers in correct order
+
         zs = []
         for lid in self.layer_ids:
             if lid not in self._hook.cache:
                 raise RuntimeError(f"Missing hook cache for layer {lid}.")
-            zs.append(self._hook.cache[lid])  # [B,H]
+            zs.append(self._hook.cache[lid])
 
         loss_anchor, metric = self._anchor_loss(zs, a_doc, a_chunk, a_view)
         loss_route, loss_vgc, route_metric, route_logits = self._compute_router_losses(
@@ -695,7 +645,7 @@ class DualAnchorTrainer(Trainer):
             + self.delta_vgc * loss_vgc
         )
 
-        # custom metrics to merge into Trainer logs
+
         metric.update(
             {
                 "loss_lm": float(lm_loss.detach().cpu()),
@@ -718,7 +668,7 @@ class DualAnchorTrainer(Trainer):
         return (total_loss, outputs) if return_outputs else total_loss
 
     def __del__(self):
-        # best-effort cleanup
+
         try:
             self._hook.remove()
         except Exception:
@@ -753,13 +703,10 @@ class JsonlLoggingCallback(TrainerCallback):
         return control
 
 
-# -------------------------
-# Main
-# -------------------------
 def main():
     ap = argparse.ArgumentParser()
 
-    # IO
+
     ap.add_argument("--model_name_or_path", type=str, required=True, help="base model path or model id")
     ap.add_argument("--train_jsonl", type=str, required=True, help="*.with_anchor_index.jsonl")
     ap.add_argument("--doc_anchor_pt", type=str, required=True, help="doc_anchor_emb.pt")
@@ -767,7 +714,7 @@ def main():
     ap.add_argument("--view_anchor_pt", type=str, default="", help="optional: view_anchor_emb.pt")
     ap.add_argument("--output_dir", type=str, required=True)
 
-    # training
+
     ap.add_argument("--max_seq_len", type=int, default=2048)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -787,7 +734,7 @@ def main():
     )
     ap.add_argument("--seed", type=int, default=42)
 
-    # lora
+
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
@@ -797,7 +744,7 @@ def main():
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     )
 
-    # formula losses
+
     ap.add_argument("--alpha", type=float, default=0.10, help="weight for anchor loss")
     ap.add_argument("--view_lambda_scale", type=float, default=0.5, help="per-layer view weight scale relative to chunk weights")
     ap.add_argument("--beta_route", type=float, default=0.05, help="weight for routing BCE loss")
@@ -810,12 +757,12 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # tokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # model
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
@@ -827,8 +774,8 @@ def main():
 
     apt_token_id = ensure_apt_token_and_resize(tokenizer, model, args.apt_token)
 
-    # load anchor embeddings (CPU)
-    doc_anchor = torch.load(args.doc_anchor_pt, map_location="cpu")   # [N, D_anchor]
+
+    doc_anchor = torch.load(args.doc_anchor_pt, map_location="cpu")
     chunk_anchor = torch.load(args.chunk_anchor_pt, map_location="cpu")
     view_anchor = torch.load(args.view_anchor_pt, map_location="cpu") if args.view_anchor_pt else None
     assert doc_anchor.shape == chunk_anchor.shape, "doc/chunk anchor embeddings must be line-aligned with same shape"
@@ -836,16 +783,16 @@ def main():
         assert doc_anchor.shape == view_anchor.shape, "view anchor embeddings must be line-aligned with doc/chunk shape"
     anchor_dim = doc_anchor.shape[1]
 
-    # add projection heads: z(hidden_size) -> anchor_dim
+
     hidden_size = model.config.hidden_size
     model.anchor_proj_doc = nn.Linear(hidden_size, anchor_dim, bias=False)
     model.anchor_proj_chunk = nn.Linear(hidden_size, anchor_dim, bias=False)
     if view_anchor is not None:
         model.anchor_proj_view = nn.Linear(hidden_size, anchor_dim, bias=False)
-    # Router head on APT hidden for the 8-view soft preference distribution.
+
     model.anchor_proj_route = nn.Linear(hidden_size, len(VIEW_NAMES), bias=False)
 
-    # LoRA
+
     target_modules = [s.strip() for s in args.lora_target_modules.split(",") if s.strip()]
     modules_to_save = ["anchor_proj_doc", "anchor_proj_chunk", "anchor_proj_route"]
     if view_anchor is not None:
@@ -857,13 +804,13 @@ def main():
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=target_modules,
-        # ensure projection heads are saved with adapters
+
         modules_to_save=modules_to_save,
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    # layers & weights
+
     layers = find_transformer_layers(model)
     num_layers = len(layers)
     layer_ids = pick_layers(num_layers)
@@ -876,7 +823,7 @@ def main():
         print(f"[INFO] lambda_view={lambda_view}")
     print(f"[INFO] anchors: N={doc_anchor.shape[0]}, D={anchor_dim}")
 
-    # Build fixed view prototypes for energy-alignment target.
+
     view_prototypes = build_view_prototypes_from_jsonl(
         jsonl_paths=[args.train_jsonl],
         view_anchor=view_anchor,
@@ -901,7 +848,7 @@ def main():
     )
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # training args
+
     targs = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -956,7 +903,7 @@ def main():
 
 
     trainer.train()
-    trainer.save_model(args.output_dir)  # saves LoRA adapters + modules_to_save
+    trainer.save_model(args.output_dir)
 
     print("[DONE] Saved to:", args.output_dir)
     print("TensorBoard logs:", os.path.join(args.output_dir, "runs"))

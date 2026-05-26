@@ -1,26 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-NOTE: Universal APT (B-scheme): we add a dedicated <|APT|> token if missing and pool at its position.
-generate_qa_phi.py
-
-End-to-end QA synthesis using a trained dual-anchor soft-guidance generator:
-  1) Probe-based multi-view routing (APT lookahead) with coverage prior + greedy selection
-  2) Question generation under selected views
-  3) Answer generation grounded directly on the current chunk body
-
-This Phi-series variant is designed to work with
-`train_phi_lora_dual_anchor.py`:
-- Loads base model + LoRA adapter (saved by Trainer.save_model()).
-- Reuses the learned projection heads `anchor_proj_doc` and `anchor_proj_chunk`.
-- Reuses the same layer set (quartiles) and doc/chunk layer-weight schedule.
-
-Phi-4-mini/Phi-3 local modeling files can require compatibility shims on this
-environment: SlidingWindowCache, LossKwargs, list-style tied weights, and a
-LongRoPE meta tensor repair.
-
-Prompts are built via `qa_prompts_updated.py` (expected in the same folder or on PYTHONPATH).
-"""
 
 import argparse
 from collections import Counter
@@ -40,9 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
-# -------------------------
-# Views (Bloom-inspired information-function taxonomy, fixed 8)
-# -------------------------
+
 VIEWS: Dict[str, str] = {
     "concept": "Ask about the core idea, meaning, or central object.",
     "mechanism": "Ask how something works, unfolds, or is carried out.",
@@ -54,9 +30,7 @@ VIEWS: Dict[str, str] = {
     "quantitative": "Ask for numbers, metrics, time, stages, or other structured facts answerable from the Body.",
 }
 
-# -------------------------
-# Import prompts
-# -------------------------
+
 def _import_prompts():
     import importlib.util
     import sys
@@ -82,8 +56,7 @@ def _import_prompts():
 
 PROMPTS = _import_prompts()
 
-# Keep view/rule definitions aligned with qa_prompts_updated.py only when it
-# already uses this canonical 8-view taxonomy.
+
 if hasattr(PROMPTS, "VIEW_DEFS") and isinstance(PROMPTS.VIEW_DEFS, dict):
     prompt_view_defs = dict(PROMPTS.VIEW_DEFS)
     if set(prompt_view_defs) == set(VIEWS):
@@ -96,11 +69,7 @@ def _token_is_single_id(tokenizer: PreTrainedTokenizerBase, s: str) -> bool:
 
 
 def ensure_phi_compat() -> None:
-    """
-    Compatibility layer for local Phi-4/Phi-3 dynamic modeling code under the
-    installed transformers build. These shims match the training script so the
-    same adapter can be loaded for generation.
-    """
+
     try:
         import transformers.cache_utils as cache_utils
     except Exception:
@@ -147,12 +116,7 @@ def ensure_phi_compat() -> None:
 
 
 def repair_phi_longrope_meta_buffers(model: nn.Module) -> int:
-    """
-    Local Phi LongRoPE stores `original_inv_freq` as a plain attribute. In some
-    transformers paths the registered `inv_freq` buffer is materialized but this
-    plain attribute remains a meta tensor, causing the first forward pass to
-    fail. We always recompute from config to avoid carrying corrupted values.
-    """
+
     repaired = 0
     for module in model.modules():
         if not (hasattr(module, "inv_freq") and hasattr(module, "original_inv_freq")):
@@ -160,7 +124,7 @@ def repair_phi_longrope_meta_buffers(model: nn.Module) -> int:
         if not (hasattr(module, "rope_init_fn") and hasattr(module, "config")):
             continue
 
-        # Always recompute from config to ensure clean values
+
         inv_freq, attention_scaling = module.rope_init_fn(module.config, torch.device("cpu"))
         module.register_buffer("inv_freq", inv_freq, persistent=False)
         module.original_inv_freq = inv_freq.detach().clone()
@@ -176,11 +140,7 @@ def repair_phi_longrope_meta_buffers(model: nn.Module) -> int:
 
 
 def get_adapter_embedding_vocab_size(lora_dir: str) -> Optional[int]:
-    """
-    PEFT may save resized input/output embeddings when special tokens were added
-    during training. If those tensors are present, the base model must be resized
-    to the checkpoint vocab size before PeftModel.from_pretrained().
-    """
+
     safe_path = os.path.join(lora_dir, "adapter_model.safetensors")
     bin_path = os.path.join(lora_dir, "adapter_model.bin")
     candidate_suffixes = (
@@ -239,12 +199,7 @@ def ensure_apt_token_and_resize(
     model: nn.Module,
     apt_token: str,
 ) -> int:
-    """
-    Universal B-scheme:
-      - Ensure `apt_token` exists in tokenizer AND maps to a single token id.
-      - If not, add it as an additional special token, then resize model embeddings.
-    Returns: apt_token_id
-    """
+
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -279,10 +234,7 @@ def ensure_apt_token_and_resize(
 
 
 def load_tokenizer_for_adapter(lora_dir: str, base_model: str) -> PreTrainedTokenizerBase:
-    """
-    Prefer the tokenizer saved alongside the adapter so special tokens and resized
-    embeddings stay aligned with training. Fall back to the base model tokenizer.
-    """
+
     try:
         tok = AutoTokenizer.from_pretrained(lora_dir, use_fast=False, trust_remote_code=False)
         print(f"[INFO] Loaded tokenizer from LoRA dir: {lora_dir}")
@@ -293,9 +245,6 @@ def load_tokenizer_for_adapter(lora_dir: str, base_model: str) -> PreTrainedToke
         return AutoTokenizer.from_pretrained(base_model, use_fast=False, trust_remote_code=False)
 
 
-# -------------------------
-# Model utils (adapted from train_lora_dual_anchor.py)
-# -------------------------
 def _unwrap_base_model(model: nn.Module) -> nn.Module:
     if hasattr(model, "get_base_model"):
         try:
@@ -322,9 +271,7 @@ def _get_optional_proj(model: nn.Module, name: str) -> Optional[nn.Module]:
 
 
 def _get_anchor_projs(model: nn.Module) -> Tuple[nn.Module, nn.Module]:
-    """
-    Anchor projection heads may live on the base model or the PEFT wrapper.
-    """
+
     proj_doc = _get_optional_proj(model, "anchor_proj_doc")
     proj_chunk = _get_optional_proj(model, "anchor_proj_chunk")
     if proj_doc is None or proj_chunk is None:
@@ -336,13 +283,10 @@ def _get_anchor_projs(model: nn.Module) -> Tuple[nn.Module, nn.Module]:
 
 
 def _ensure_anchor_projs_from_adapter(model: nn.Module, lora_dir: str, device: torch.device, dtype: torch.dtype) -> None:
-    """
-    If anchor_proj_* modules are missing, try to load them from adapter_model.safetensors
-    and attach to the base model (base.model if present).
-    """
+
     adapter_path = os.path.join(lora_dir, "adapter_model.safetensors")
     if not os.path.exists(adapter_path):
-        # If projections already exist on model, keep going.
+
         _get_anchor_projs(model)
         return
 
@@ -390,7 +334,7 @@ def _ensure_anchor_projs_from_adapter(model: nn.Module, lora_dir: str, device: t
             continue
         setattr(target, name, _make_linear(w))
 
-    # doc/chunk are mandatory for this script
+
     _get_anchor_projs(model)
 
 
@@ -399,9 +343,7 @@ def _load_view_prototypes_for_views(
     view_names: List[str],
     override_path: str = "",
 ) -> Optional[torch.Tensor]:
-    """
-    Load view prototypes saved by training, then align rows to current view_names order.
-    """
+
     vp_path = override_path or os.path.join(lora_dir, "view_prototypes.pt")
     if not os.path.exists(vp_path):
         return None
@@ -449,7 +391,7 @@ def find_transformer_layers(model: nn.Module) -> List[nn.Module]:
             candidates.append((name, mod))
     if not candidates:
         raise ValueError(f"Cannot locate transformer layers: no nn.ModuleList len={num_layers}.")
-    # pick best-looking
+
     def score(modlist: nn.ModuleList) -> int:
         m0 = modlist[0]
         s = 0
@@ -486,7 +428,7 @@ class PooledLayerHook:
         self.layers = layers
         self.layer_ids = layer_ids
         self.handles: List[Any] = []
-        self.pool_idx: Optional[torch.Tensor] = None  # [B]
+        self.pool_idx: Optional[torch.Tensor] = None
         self.cache: Dict[int, torch.Tensor] = {}
 
     def clear(self):
@@ -494,12 +436,12 @@ class PooledLayerHook:
 
     def _make_hook(self, layer_id: int):
         def hook_fn(module, inp, out):
-            hs = out[0] if isinstance(out, (tuple, list)) else out  # [B,T,H]
+            hs = out[0] if isinstance(out, (tuple, list)) else out
             if self.pool_idx is None:
                 return
             B = hs.size(0)
             idx = self.pool_idx
-            z = hs[torch.arange(B, device=hs.device), idx]  # [B,H]
+            z = hs[torch.arange(B, device=hs.device), idx]
             self.cache[layer_id] = z
         return hook_fn
 
@@ -513,15 +455,10 @@ class PooledLayerHook:
         self.handles = []
 
 
-# -------------------------
-# Data I/O
-# -------------------------
 def read_jsonl(path: str) -> List[Dict[str, Any]]:
-    """
-    Read either JSONL (one object per line) or JSON array (.json).
-    """
+
     with open(path, "r", encoding="utf-8") as f:
-        # Peek first non-whitespace char
+
         pos = f.tell()
         ch = f.read(1)
         while ch and ch.isspace():
@@ -627,11 +564,7 @@ def iter_jsonl(path: str):
 
 
 def read_last_jsonl_row(path: str) -> Optional[Dict[str, Any]]:
-    """
-    Read the last non-empty JSON object from a jsonl file by scanning from file tail.
-    This is used by resume logic to continue after the last successfully written chunk
-    instead of re-walking failed chunks from the beginning of the input file.
-    """
+
     if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
         return None
     with open(path, "rb") as f:
@@ -708,7 +641,7 @@ def _build_probe_prompt(ctx: Dict[str, Any], view_name: str, apt_token: str) -> 
     sig = inspect.signature(fn)
     if "ctx" in sig.parameters:
         return fn(ctx=_make_prompt_ctx(ctx), view=view_name, apt_token=apt_token)
-    # backward-compatible fallback
+
     return fn(
         article_summary=ctx["article_summary"],
         doc_keywords=ctx["doc_keywords"],
@@ -729,13 +662,13 @@ def _build_question_prompt(ctx: Dict[str, Any], view_name: str, n_questions: int
         if "ctx" in sig.parameters:
             return fn(
                 ctx=_make_prompt_ctx(ctx),
-                # v2 prompt outputs ONE question only
+
                 number=1,
                 view=view_name,
                 existing_questions=existing_questions,
             )
     if hasattr(PROMPTS, "build_question_generation_prompt"):
-        # fallback (older VRQA prompt): still request 1 question
+
         return PROMPTS.build_question_generation_prompt(
             text=ctx["body"],
             abstract=ctx["article_summary"],
@@ -773,14 +706,14 @@ def _extract_json_array(text: str) -> List[str]:
     t = text.strip()
     if not t:
         return []
-    # direct parse
+
     try:
         obj = json.loads(t)
         if isinstance(obj, list):
             return [str(x).strip() for x in obj if str(x).strip()]
     except Exception:
         pass
-    # fenced code blocks
+
     m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, flags=re.I)
     if m:
         try:
@@ -789,7 +722,7 @@ def _extract_json_array(text: str) -> List[str]:
                 return [str(x).strip() for x in obj if str(x).strip()]
         except Exception:
             pass
-    # bracket fallback
+
     m2 = re.search(r"\[[\s\S]*\]", t)
     if m2:
         try:
@@ -812,7 +745,7 @@ def _first_question(s: str) -> str:
     t = (s or "").strip()
     if not t:
         return ""
-    # grab first sentence ending with ? or ？
+
     m = re.search(r"(.+?[\\?？])", t)
     if m:
         return m.group(1).strip()
@@ -846,11 +779,7 @@ def _content_tokens(text: str) -> List[str]:
 
 
 def _normalize_chunk_text(text: str) -> str:
-    """
-    Normalize chunk/body text before prompt construction.
-    This removes noisy hard line breaks from raw content while preserving
-    readable sentence spacing for downstream sentence splitting.
-    """
+
     t = (text or "").strip()
     if not t:
         return ""
@@ -911,7 +840,7 @@ def _clean_answer_surface(text: str) -> str:
     t = re.sub(r"\s+([,.;:!?])", r"\1", t)
     t = re.sub(r"([(\[])\s+", r"\1", t)
     t = re.sub(r"\s+([)\]])", r"\1", t)
-    # Repair a few frequent split artifacts from small-model decoding.
+
     t = re.sub(r"\bnon-\s+sm\s+art\b", "non-smart", t, flags=re.I)
     t = re.sub(r"\bsm\s+art\b", "smart", t, flags=re.I)
     t = re.sub(r"\bsurfactents\b", "surfactants", t, flags=re.I)
@@ -1014,13 +943,13 @@ def _pick_best_answer(candidates: List[str], body: str) -> str:
         if not a or not a.strip():
             return True
         t = a.strip()
-        # too short
+
         if len(t) < 3:
             return True
-        # repeated single char / symbol like "？？？？" or "aaaaa"
+
         if len(set(t)) <= 2 and len(t) >= 6:
             return True
-        # excessive repeated punctuation
+
         if re.fullmatch(r"[\\?？!！,，.。;；:：\\-\\s]{6,}", t):
             return True
         return False
@@ -1040,10 +969,7 @@ def _pick_best_answer(candidates: List[str], body: str) -> str:
 
 
 def build_chunk_context(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Collect minimal fields for prompt building.
-    The prompt module can accept empty strings; we keep this flexible.
-    """
+
     doc_kws = _to_list_keywords(
         _get_field(
             row,
@@ -1082,9 +1008,6 @@ def build_chunk_context(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# -------------------------
-# Probe routing
-# -------------------------
 @torch.no_grad()
 def compute_anchor_energy(
     model: nn.Module,
@@ -1102,15 +1025,12 @@ def compute_anchor_energy(
     lambda_chunk: List[float],
     device: torch.device,
 ) -> Tuple[float, float, float, Optional[float], Optional[float]]:
-    """
-    Run a single forward pass on `prompt` and compute anchor energy at APT position.
-    Energy definition matches training: sum_l (lambda_doc*(1-cos_doc) + lambda_chunk*(1-cos_chunk)).
-    """
+
     enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = enc["input_ids"].to(device)
     attn = enc["attention_mask"].to(device)
 
-    # locate APT position (last occurrence)
+
     ids = input_ids[0].tolist()
     try:
         apt_pos = len(ids) - 1 - ids[::-1].index(apt_token_id)
@@ -1121,10 +1041,10 @@ def compute_anchor_energy(
     hook.clear()
     _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
 
-    zs = [hook.cache[lid] for lid in layer_ids]  # [1,H]
+    zs = [hook.cache[lid] for lid in layer_ids]
     proj_doc, proj_chunk = _get_anchor_projs(model)
 
-    # normalize anchors
+
     a_doc_n = F.normalize(a_doc.to(device=device, dtype=torch.float32).unsqueeze(0), p=2, dim=-1)
     a_chunk_n = F.normalize(a_chunk.to(device=device, dtype=torch.float32).unsqueeze(0), p=2, dim=-1)
 
@@ -1148,7 +1068,7 @@ def compute_anchor_energy(
 
     proj_route = _get_optional_proj(model, "anchor_proj_route")
     if proj_route is not None:
-        logits = proj_route(z_route).float()  # [1,V]
+        logits = proj_route(z_route).float()
         vid = int(view_to_id.get(view_name, -1))
         if 0 <= vid < logits.size(-1):
             route_logit_cur = float(logits[0, vid].detach().cpu())
@@ -1156,7 +1076,7 @@ def compute_anchor_energy(
     proj_view = _get_optional_proj(model, "anchor_proj_view")
     vid = int(view_to_id.get(view_name, -1))
     if proj_view is not None and view_prototypes is not None and 0 <= vid < int(view_prototypes.size(0)):
-        z_view = F.normalize(proj_view(z_route).float(), p=2, dim=-1)  # [1,D]
+        z_view = F.normalize(proj_view(z_route).float(), p=2, dim=-1)
         proto = F.normalize(view_prototypes[vid].to(device=device, dtype=torch.float32), p=2, dim=-1).unsqueeze(0)
         cos = (z_view * proto).sum(dim=-1)
         view_energy_cur = float((1.0 - cos).mean().detach().cpu())
@@ -1181,16 +1101,12 @@ def compute_anchor_energy_batch(
     lambda_chunk: List[float],
     device: torch.device,
 ) -> Tuple[List[float], List[float], List[float], List[Optional[float]], List[Optional[float]]]:
-    """
-    Batched forward pass for multiple prompts (views).
-    Returns lists aligned with `prompts`:
-      total/doc/chunk energy + route logit for current candidate view + view energy for current candidate view.
-    """
+
     enc = tokenizer(prompts, return_tensors="pt", add_special_tokens=False, padding=True)
     input_ids = enc["input_ids"].to(device)
     attn = enc["attention_mask"].to(device)
 
-    # locate APT position per row (last occurrence)
+
     ids = input_ids.tolist()
     apt_pos = []
     for row in ids:
@@ -1203,10 +1119,10 @@ def compute_anchor_energy_batch(
     hook.clear()
     _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
 
-    zs = [hook.cache[lid] for lid in layer_ids]  # each [B,H]
+    zs = [hook.cache[lid] for lid in layer_ids]
     proj_doc, proj_chunk = _get_anchor_projs(model)
 
-    # normalize anchors (broadcast to [B,D])
+
     a_doc_n = F.normalize(a_doc.to(device=device, dtype=proj_doc.weight.dtype), p=2, dim=-1).unsqueeze(0)
     a_chunk_n = F.normalize(a_chunk.to(device=device, dtype=proj_chunk.weight.dtype), p=2, dim=-1).unsqueeze(0)
     a_doc_n = a_doc_n.expand(input_ids.size(0), -1)
@@ -1231,10 +1147,10 @@ def compute_anchor_energy_batch(
     route_list: List[Optional[float]] = [None] * input_ids.size(0)
     view_e_list: List[Optional[float]] = [None] * input_ids.size(0)
 
-    z_route = zs[-1].to(dtype=proj_doc.weight.dtype)  # [B,H]
+    z_route = zs[-1].to(dtype=proj_doc.weight.dtype)
     proj_route = _get_optional_proj(model, "anchor_proj_route")
     if proj_route is not None:
-        logits = proj_route(z_route).float()  # [B,V]
+        logits = proj_route(z_route).float()
         for i, vname in enumerate(view_names):
             vid = int(view_to_id.get(vname, -1))
             if 0 <= vid < logits.size(-1):
@@ -1242,8 +1158,8 @@ def compute_anchor_energy_batch(
 
     proj_view = _get_optional_proj(model, "anchor_proj_view")
     if proj_view is not None and view_prototypes is not None:
-        z_view = F.normalize(proj_view(z_route).float(), p=2, dim=-1)  # [B,D]
-        proto = F.normalize(view_prototypes.to(device=device, dtype=torch.float32), p=2, dim=-1)  # [V,D]
+        z_view = F.normalize(proj_view(z_route).float(), p=2, dim=-1)
+        proto = F.normalize(view_prototypes.to(device=device, dtype=torch.float32), p=2, dim=-1)
         for i, vname in enumerate(view_names):
             vid = int(view_to_id.get(vname, -1))
             if 0 <= vid < proto.size(0):
@@ -1271,10 +1187,7 @@ def select_views_greedy(
     count_doc: Dict[str, int],
     K: int,
 ) -> List[str]:
-    """
-    Greedy selection:
-      score(view) = -energy + coverage_bias
-    """
+
     selected: List[str] = []
     remaining = list(energies.keys())
 
@@ -1297,7 +1210,7 @@ def select_views_greedy(
             best_v = min(remaining, key=lambda v: (count_global.get(v, 0), count_doc.get(v, 0), list(VIEWS).index(v)))
         selected.append(best_v)
         remaining.remove(best_v)
-        # update doc counts immediately to encourage diversity within same chunk
+
         count_doc[best_v] = count_doc.get(best_v, 0) + 1
 
     return selected
@@ -1308,11 +1221,7 @@ def build_routing_energy(
     route_logits: Dict[str, Optional[float]],
     view_energies: Dict[str, Optional[float]],
 ) -> Dict[str, float]:
-    """
-    Convert heterogeneous signals to one comparable routing energy:
-      E_route = E_docchunk + E_view - route_logit
-    Lower is better.
-    """
+
     out: Dict[str, float] = {}
     for v, e_dc in energies_docchunk.items():
         val = float(e_dc)
@@ -1332,13 +1241,8 @@ def build_routing_energy(
     return out
 
 
-# -------------------------
-# Generation helpers
-# -------------------------
 def _strip_prompt_from_decode(tokenizer, input_ids: torch.Tensor, gen_ids: torch.Tensor) -> str:
-    """
-    Decode only the newly generated part after prompt length.
-    """
+
     plen = input_ids.shape[1]
     out_ids = gen_ids[0, plen:]
     return tokenizer.decode(out_ids, skip_special_tokens=True).strip()
@@ -1465,10 +1369,6 @@ def _answer_ok(
     return True, ""
 
 
-# -------------------------
-# Postprocess helpers# -------------------------
-# Postprocess helpers (QA v2)
-# -------------------------
 def _postprocess_single_line(txt: str) -> str:
     txt = (txt or "").strip()
     if not txt:
@@ -1481,30 +1381,24 @@ _NOT_STATED_ANSWERS = {"Not stated in the provided text.", "Not stated in the Bo
 
 
 def _postprocess_answer(txt: str, max_sentences: int = 2, max_chars_fallback: int = 220) -> str:
-    """Postprocess answer text for small models.
 
-    - Do NOT truncate by line (answers may span multiple lines).
-    - Strip common prefixes (Answer:, ### Response:, etc.).
-    - Keep at most `max_sentences` sentences by punctuation.
-    """
     txt = (txt or "").strip()
     if not txt:
         return ""
     txt = _ANS_PREFIX_RE.sub("", txt).strip()
 
-    # Collapse excessive whitespace/newlines.
+
     txt = re.sub(r"\s+", " ", txt).strip()
     txt = _BAD_TAIL_RE.sub("", txt).strip(" ,;:-")
 
-    # Keep the first complete sentence(s). Treat '.' as a sentence end only
-    # when it is not part of a decimal number.
+
     end_re = re.compile(r"(?<!\d)\.(?!\d)|[。！？!?]")
     ends = [m.end() for m in end_re.finditer(txt)]
     if ends:
         cut = ends[min(max_sentences, len(ends)) - 1]
         return txt[:cut].strip()
 
-    # Fallback: trim to a natural boundary first, then to a word boundary.
+
     txt = txt[:max_chars_fallback].strip()
     for sep in ["; ", ", ", " and ", " but "]:
         pos = txt.rfind(sep)
@@ -1523,9 +1417,9 @@ def _postprocess_answer(txt: str, max_sentences: int = 2, max_chars_fallback: in
 def is_bad_question(q: str, min_len: int = 8) -> bool:
     if not q or len(q.strip()) < min_len:
         return True
-    # must contain at least one '?', or end with '？'/'?'
+
     if "?" not in q and "？" not in q:
-        # allow "What/How/Why..." as question-like
+
         if not re.match(r"^(what|how|why|when|where|which|who)\b", q.strip(), flags=re.I):
             return True
     return False
@@ -1605,40 +1499,37 @@ def generate_answer_text(
     return _postprocess_answer(txt, max_sentences=max_sentences)
 
 
-# -------------------------
-# Main
-# -------------------------
 def main():
     ap = argparse.ArgumentParser()
 
-    # Model
+
     ap.add_argument("--base_model", type=str, required=True, help="Base model name/path (same as training model_name_or_path)")
     ap.add_argument("--lora_dir", type=str, required=True, help="LoRA adapter dir (output_dir from training)")
     ap.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--device", type=str, default="cuda")
 
-    # Anchors
+
     ap.add_argument("--doc_anchor_pt", type=str, required=True, help="doc_anchor_emb.pt (same alignment as input jsonl)")
     ap.add_argument("--chunk_anchor_pt", type=str, required=True, help="chunk_anchor_emb.pt")
     ap.add_argument("--anchor_row_key", type=str, default="anchor_row_idx", help="field name in input jsonl for anchor row index")
 
-    # Data
+
     ap.add_argument("--input_jsonl", type=str, required=True, help="Input chunks jsonl")
     ap.add_argument("--output_jsonl", type=str, required=True, help="Output QA jsonl")
     ap.add_argument("--log_jsonl", type=str, default="", help="Optional routing logs jsonl (energies, selected views)")
     ap.add_argument("--trace_jsonl", type=str, default="", help="Optional trace jsonl (per-QA prompts/outputs)")
     ap.add_argument("--trace_include_prompts", action="store_true", help="Include prompts in trace_jsonl (large)")
 
-    # Routing
+
     ap.add_argument("--K", type=int, default=3, help="number of views per chunk")
     ap.add_argument("--apt_token", type=str, default="<|APT|>", help="Dedicated APT token inserted before ### Response.")
 
-    # Generation
+
     ap.add_argument("--m_retry", type=int, default=2, help="question retry times if bad/duplicate")
     ap.add_argument("--q_max_new_tokens", type=int, default=256)
     ap.add_argument("--a_max_new_tokens", type=int, default=512)
     ap.add_argument("--temperature_q", type=float, default=0.7)
-    # For answers, default deterministic decoding to avoid verbose / drifting outputs.
+
     ap.add_argument("--temperature_a", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--repetition_penalty", type=float, default=1.05)
@@ -1652,7 +1543,7 @@ def main():
     ap.add_argument("--view_prototypes_pt", type=str, default="", help="optional path to view_prototypes.pt; default uses <lora_dir>/view_prototypes.pt")
     ap.add_argument("--seed", type=int, default=42)
 
-    # Probe routing
+
     ap.add_argument(
         "--probe_batch",
         action="store_true",
@@ -1660,7 +1551,7 @@ def main():
         help="Use batched probe routing (recommended). If OOM or failure, will fallback to per-view probing.",
     )
 
-    # Coverage counts persistence
+
     ap.add_argument("--counts_json", type=str, default="", help="Optional json file to load/save global view counts")
     ap.add_argument("--summary_json", type=str, default="", help="Optional summary json path for view histograms/log stats")
     ap.add_argument("--log_file", type=str, default="", help="Optional log file path (tee stdout/stderr)")
@@ -1694,12 +1585,12 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     dtype = torch.bfloat16 if args.dtype == "bf16" else (torch.float16 if args.dtype == "fp16" else torch.float32)
 
-    # tokenizer
+
     tok = load_tokenizer_for_adapter(args.lora_dir, args.base_model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # model (base + LoRA)
+
     try:
         from peft import PeftModel
     except Exception as e:
@@ -1720,7 +1611,7 @@ def main():
     model = PeftModel.from_pretrained(base, args.lora_dir).to(device)
     model.eval()
 
-    # quick compatibility check: base model path in adapter config should match --base_model
+
     adapter_cfg = os.path.join(args.lora_dir, "adapter_config.json")
     if os.path.exists(adapter_cfg):
         try:
@@ -1732,7 +1623,7 @@ def main():
         except Exception:
             pass
 
-    # Ensure the trained dual-anchor projection heads are available.
+
     _ensure_anchor_projs_from_adapter(model, args.lora_dir, device=device, dtype=dtype)
     model_base = _unwrap_base_model(model)
     route_proj = _get_optional_proj(model, "anchor_proj_route")
@@ -1744,15 +1635,15 @@ def main():
     if view_proj is None:
         print("[WARN] anchor_proj_view not found; view-energy term will be disabled.")
 
-    # layers & hook for probing
+
     layers = find_transformer_layers(model)
     layer_ids = pick_layers(len(layers))
     lambda_doc, lambda_chunk = make_layer_weights(len(layer_ids))
     hook = PooledLayerHook(layers, layer_ids)
     hook.register()
 
-    # anchors
-    doc_anchor = torch.load(args.doc_anchor_pt, map_location="cpu")  # [N, D]
+
+    doc_anchor = torch.load(args.doc_anchor_pt, map_location="cpu")
     chunk_anchor = torch.load(args.chunk_anchor_pt, map_location="cpu")
     assert doc_anchor.shape == chunk_anchor.shape, "doc/chunk anchor embeddings must have same shape"
     N = doc_anchor.shape[0]
@@ -1777,7 +1668,7 @@ def main():
     else:
         print(f"[INFO] Loaded aligned view prototypes: shape={tuple(view_prototypes.shape)}")
 
-    # global counts
+
     count_global: Dict[str, int] = {k: 0 for k in VIEWS}
     if args.counts_json and os.path.exists(args.counts_json):
         with open(args.counts_json, "r", encoding="utf-8") as f:
@@ -1787,7 +1678,7 @@ def main():
                 if k in count_global:
                     count_global[k] = int(v)
 
-    # load data
+
     rows = read_jsonl(args.input_jsonl)
     chunk_id_to_index: Dict[str, int] = {}
     for idx, row in enumerate(rows):
@@ -1795,7 +1686,7 @@ def main():
         if cid not in chunk_id_to_index:
             chunk_id_to_index[cid] = idx
 
-    # resume support: read existing outputs if present
+
     seen_chunk_ids = set()
     hist_view_selected: Dict[str, int] = {k: 0 for k in VIEWS}
     hist_view_in_final_questions: Dict[str, int] = {k: 0 for k in VIEWS}
@@ -1842,7 +1733,7 @@ def main():
                 for vv in sv:
                     if vv in hist_view_selected:
                         hist_view_selected[vv] = hist_view_selected.get(vv, 0) + 1
-                # track last doc_id + per-doc counts for resume
+
                 doc_id = str(r.get("doc_id", "")) or ""
                 if doc_id:
                     if doc_id != last_doc_id:
@@ -1853,7 +1744,7 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to read existing output for resume: {e}")
 
-    # output writers (append for resume)
+
     out_f = open(args.output_jsonl, "a", encoding="utf-8") if args.output_jsonl else None
     log_f = open(args.log_jsonl, "a", encoding="utf-8") if args.log_jsonl else None
     trace_f = open(args.trace_jsonl, "a", encoding="utf-8") if args.trace_jsonl else None
@@ -1873,7 +1764,7 @@ def main():
 
         print(f"[INFO] chunk {i+1}/{len(rows)} doc_id={doc_id} chunk_id={chunk_id}")
 
-        # anchor index
+
         anchor_row = row.get(args.anchor_row_key, row.get("anchor_row", row.get("anchor_idx", None)))
         if anchor_row is None:
             anchor_row = i
@@ -1884,7 +1775,7 @@ def main():
         a_doc = doc_anchor[anchor_row]
         a_chunk = chunk_anchor[anchor_row]
 
-        # --------- probe energies for all views (prefer batched) ---------
+
         probe_prompts = [
             _build_probe_prompt(
                 ctx=ctx,
@@ -1923,12 +1814,12 @@ def main():
                 route_logits_cur = {v: r_cur_list[i] for i, v in enumerate(view_names)}
                 energies_view = {v: e_view_list[i] for i, v in enumerate(view_names)}
             except RuntimeError as e:
-                # Typical failure: CUDA OOM under long prompts.
+
                 print(f"[WARN] Batched probe routing failed; fallback to per-view probing. err={e}")
                 torch.cuda.empty_cache()
 
         if not energies:
-            # per-view fallback (slower but robust)
+
             for vname, pp in zip(view_names, probe_prompts):
                 e, e_doc, e_chunk, r_cur, e_view = compute_anchor_energy(
                     model=model,
@@ -1958,8 +1849,7 @@ def main():
             view_energies=energies_view,
         )
 
-        # --------- select K views (greedy with coverage bias) ---------
-        # NOTE: select_views_greedy updates count_doc internally (for within-chunk diversity)
+
         selected_views = select_views_greedy(
             energies=routing_energy,
             count_global=count_global,
@@ -1991,11 +1881,11 @@ def main():
             hist_view_selected[v] = hist_view_selected.get(v, 0) + 1
             count_global[v] = count_global.get(v, 0) + 1
 
-        # --------- generate Q -> A sequentially (one QA per line) ---------
+
         seen_questions: List[str] = []
         seen_final_qas: List[Dict[str, Any]] = []
         view_to_questions: Dict[str, List[str]] = {}
-        q_idx_global = 0  # question_idx within chunk across all views
+        q_idx_global = 0
         for vname in selected_views:
             questions: List[str] = []
             for _ in range(1):
@@ -2034,7 +1924,7 @@ def main():
                     q_completion_tokens_total += _count_tokens(tok, raw_q)
                     last_raw = raw_q
                     num_q_attempts += 1
-                    # v2 prompt: raw_q should already be ONE question line
+
                     q = _normalize_question(_first_question(raw_q))
                     q_bad = (not q) or is_bad_question(q)
                     dup = _question_is_near_duplicate(q, seen_questions + questions)
@@ -2063,7 +1953,7 @@ def main():
                     question = q
                     break
 
-                # If still invalid after retries, skip this routed view.
+
                 if not question:
                     num_q_skipped += 1
                     continue
@@ -2231,7 +2121,7 @@ def main():
         if (i + 1) % 20 == 0:
             print(f"[INFO] processed {i+1}/{len(rows)} chunks")
 
-    # close writers
+
     if out_f is not None:
         out_f.close()
     if log_f is not None:
@@ -2289,7 +2179,7 @@ def main():
     if a_retry_fail_reasons:
         print("[STATS] answer_fail_reasons_retry:", dict(a_retry_fail_reasons))
 
-    # cleanup hook
+
     try:
         hook.remove()
     except Exception:

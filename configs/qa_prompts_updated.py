@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Prompt builders for view-conditioned QA generation.
-
-This module follows the prompt flow in ``提示词.docx``:
-1. select suitable views for a chunk;
-2. generate a question under each selected view and the current chunk;
-3. generate the answer from the same view, generated question, and chunk body.
-
-There is intentionally no intermediate evidence extraction step.
-"""
 
 from __future__ import annotations
 

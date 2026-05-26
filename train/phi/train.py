@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Phi-4-mini-instruct LoRA dual-anchor training script.
-Adapted from train_lora_dual_anchor.py for Phi-4 architecture.
-
-Key differences from Qwen version:
-  - Default LoRA target modules: qkv_proj, o_proj, gate_up_proj, down_proj
-    (Phi-4 uses combined QKV and gate_up projections)
-"""
 
 import argparse
 import json
@@ -34,9 +25,7 @@ from transformers import (
 
 from peft import LoraConfig, get_peft_model
 
-# -------------------------
-# View taxonomy (Bloom-inspired information-function taxonomy, fixed 8)
-# -------------------------
+
 VIEW_NAMES: List[str] = [
     "concept",
     "mechanism",
@@ -54,15 +43,10 @@ def normalize_view_name(view: str) -> str:
     return str(view or "").strip().lower()
 
 
-# -------------------------
-# Utilities
-# -------------------------
 import torch.nn as nn
 
 def _unwrap_base_model(model: nn.Module) -> nn.Module:
-    """
-    Unwrap PEFT model to the underlying HF model if needed.
-    """
+
     if hasattr(model, "get_base_model"):
         try:
             return model.get_base_model()
@@ -82,14 +66,7 @@ def _token_is_single_id(tokenizer: PreTrainedTokenizerBase, s: str) -> bool:
 
 
 def ensure_phi_cache_compat() -> None:
-    """
-    Some local Phi-4/Phi-3 modeling files import SlidingWindowCache, while a
-    few transformers builds expose Cache/DynamicCache/StaticCache but not that
-    symbol. The same local file imports LossKwargs from transformers.utils,
-    which is only a typing helper in newer builds. Training runs with
-    use_cache=False, so these shims only need to satisfy import-time/type
-    checks in the dynamic module.
-    """
+
     try:
         import transformers.cache_utils as cache_utils
     except Exception:
@@ -136,17 +113,7 @@ def ensure_phi_cache_compat() -> None:
 
 
 def repair_phi_longrope_meta_buffers(model: nn.Module) -> int:
-    """
-    The local Phi-4/Phi-3 dynamic modeling code keeps a second RoPE tensor in
-    `original_inv_freq` as a plain attribute. Some transformers builds
-    materialize the registered `inv_freq` buffer during from_pretrained(), but
-    leave that plain attribute pointing at the meta tensor created at init time.
-    LongRoPE then fails on the first forward when it calls
-    `self.original_inv_freq.to(device)`.
 
-    We always recompute inv_freq from the config to avoid carrying over any
-    corrupted values from the checkpoint.
-    """
     repaired = 0
     for module in model.modules():
         if not (hasattr(module, "inv_freq") and hasattr(module, "original_inv_freq")):
@@ -154,7 +121,7 @@ def repair_phi_longrope_meta_buffers(model: nn.Module) -> int:
         if not (hasattr(module, "rope_init_fn") and hasattr(module, "config")):
             continue
 
-        # Always recompute from config to ensure clean values
+
         inv_freq, attention_scaling = module.rope_init_fn(module.config, torch.device("cpu"))
         module.register_buffer("inv_freq", inv_freq, persistent=False)
         module.original_inv_freq = inv_freq.detach().clone()
@@ -232,10 +199,7 @@ def ensure_apt_token_and_resize(
 
 
 def find_transformer_layers(model: nn.Module):
-    """
-    Robustly locate decoder block list (ModuleList) by scanning the model.
-    Works for Phi/Qwen/LLaMA/GPT-style and PEFT-wrapped models.
-    """
+
     base = _unwrap_base_model(model)
     cfg = getattr(base, "config", None)
 
@@ -275,7 +239,6 @@ def find_transformer_layers(model: nn.Module):
           f"first_layer={best_list[0].__class__.__name__}")
 
     return list(best_list)
-
 
 
 def pick_layers(num_layers: int) -> List[int]:
@@ -359,9 +322,6 @@ def build_view_prototypes_from_jsonl(
     return F.normalize(protos, p=2, dim=-1)
 
 
-# -------------------------
-# Dataset & Collator
-# -------------------------
 class JSONLSFTDataset(Dataset):
     def __init__(
         self,
@@ -484,9 +444,6 @@ class DataCollatorWithPadding:
         return batch
 
 
-# -------------------------
-# Hook: store pooled z^l only (B x H)
-# -------------------------
 class PooledLayerHook:
     SKIP_DURING_EXTERNAL_FORWARD = False
 
@@ -523,9 +480,6 @@ class PooledLayerHook:
         self.handles = []
 
 
-# -------------------------
-# Custom Trainer
-# -------------------------
 class DualAnchorTrainer(Trainer):
     def __init__(
         self,
@@ -819,13 +773,10 @@ class FiniteParameterCallback(TrainerCallback):
         return control
 
 
-# -------------------------
-# Main
-# -------------------------
 def main():
     ap = argparse.ArgumentParser()
 
-    # IO
+
     ap.add_argument("--model_name_or_path", type=str, required=True, help="base model path or model id")
     ap.add_argument("--train_jsonl", type=str, required=True, help="*.with_anchor_index.jsonl")
     ap.add_argument("--doc_anchor_pt", type=str, required=True, help="doc_anchor_emb.pt")
@@ -833,7 +784,7 @@ def main():
     ap.add_argument("--view_anchor_pt", type=str, default="", help="optional: view_anchor_emb.pt")
     ap.add_argument("--output_dir", type=str, required=True)
 
-    # training
+
     ap.add_argument("--max_seq_len", type=int, default=2048)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -861,7 +812,7 @@ def main():
         help="load tokenizer with use_fast=True; pass --no-tokenizer_use_fast to force slow/backend fallback",
     )
 
-    # lora - Phi-4 uses combined projections
+
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
@@ -872,7 +823,7 @@ def main():
         help="auto selects Phi qkv_proj/o_proj/gate_up_proj/down_proj; otherwise pass comma-separated module suffixes",
     )
 
-    # formula losses
+
     ap.add_argument("--alpha", type=float, default=0.10, help="weight for anchor loss")
     ap.add_argument("--view_lambda_scale", type=float, default=0.5, help="per-layer view weight scale relative to chunk weights")
     ap.add_argument("--beta_route", type=float, default=0.05, help="weight for routing BCE loss")
@@ -888,7 +839,7 @@ def main():
 
     model_cfg = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=False)
 
-    # tokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         use_fast=bool(args.tokenizer_use_fast),
@@ -903,7 +854,7 @@ def main():
         "fp32": torch.float32,
     }[args.dtype]
 
-    # model
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch_dtype,
@@ -915,7 +866,7 @@ def main():
 
     apt_token_id = ensure_apt_token_and_resize(tokenizer, model, args.apt_token)
 
-    # load anchor embeddings (CPU)
+
     doc_anchor = torch.load(args.doc_anchor_pt, map_location="cpu")
     chunk_anchor = torch.load(args.chunk_anchor_pt, map_location="cpu")
     view_anchor = torch.load(args.view_anchor_pt, map_location="cpu") if args.view_anchor_pt else None
@@ -924,7 +875,7 @@ def main():
         assert doc_anchor.shape == view_anchor.shape, "view anchor embeddings must be line-aligned with doc/chunk shape"
     anchor_dim = doc_anchor.shape[1]
 
-    # add projection heads: z(hidden_size) -> anchor_dim
+
     hidden_size = model.config.hidden_size
     model.anchor_proj_doc = nn.Linear(hidden_size, anchor_dim, bias=False)
     model.anchor_proj_chunk = nn.Linear(hidden_size, anchor_dim, bias=False)
@@ -932,9 +883,7 @@ def main():
         model.anchor_proj_view = nn.Linear(hidden_size, anchor_dim, bias=False)
     model.anchor_proj_route = nn.Linear(hidden_size, len(VIEW_NAMES), bias=False)
 
-    # LoRA target modules. Phi-4-mini uses the Phi3 implementation with
-    # combined qkv/gate_up projections; Qwen/LLaMA-style models use split
-    # projections. Keep explicit override support for experiments.
+
     if args.lora_target_modules.strip().lower() == "auto":
         mt = str(getattr(model_cfg, "model_type", "")).lower()
         if mt in {"phi3", "phi"}:
@@ -960,7 +909,7 @@ def main():
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    # layers & weights
+
     layers = find_transformer_layers(model)
     num_layers = len(layers)
     layer_ids = pick_layers(num_layers)
@@ -973,7 +922,7 @@ def main():
         print(f"[INFO] lambda_view={lambda_view}")
     print(f"[INFO] anchors: N={doc_anchor.shape[0]}, D={anchor_dim}")
 
-    # Build fixed view prototypes for energy-alignment target.
+
     view_prototypes = build_view_prototypes_from_jsonl(
         jsonl_paths=[args.train_jsonl],
         view_anchor=view_anchor,
@@ -998,7 +947,7 @@ def main():
     )
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # training args
+
     targs = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,

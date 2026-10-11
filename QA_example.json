@@ -1,0 +1,20 @@
+[
+  {
+    "view": "evidence",
+    "qa_index": 1,
+    "question": "What evidence supports the use of recall systems for multidose vaccination?",
+    "answer": "At least one-third of adults who start the three-dose hepatitis B vaccine series do not complete it, which may compromise vaccine efficacy or the duration of protection."
+  },
+  {
+    "view": "causation",
+    "qa_index": 2,
+    "question": "What can compromise vaccine efficacy or the duration of protection in a multidose series?",
+    "answer": "Failing to complete the series or receive later doses at the recommended intervals."
+  },
+  {
+    "view": "quantitative",
+    "qa_index": 3,
+    "question": "What proportion of adults who start the three-dose hepatitis B vaccine series do not complete it?",
+    "answer": "At least one-third."
+  }
+]

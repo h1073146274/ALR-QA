@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Phi-4-mini-instruct LoRA dual-anchor training script.
+Adapted from train_lora_dual_anchor.py for Phi-4 architecture.
+
+Key differences from Qwen version:
+  - Default LoRA target modules: qkv_proj, o_proj, gate_up_proj, down_proj
+    (Phi-4 uses combined QKV and gate_up projections)
+"""
 
 import argparse
 import json
@@ -25,7 +34,9 @@ from transformers import (
 
 from peft import LoraConfig, get_peft_model
 
-
+# -------------------------
+# View taxonomy (Bloom-inspired information-function taxonomy, fixed 8)
+# -------------------------
 VIEW_NAMES: List[str] = [
     "concept",
     "mechanism",
@@ -43,10 +54,15 @@ def normalize_view_name(view: str) -> str:
     return str(view or "").strip().lower()
 
 
+# -------------------------
+# Utilities
+# -------------------------
 import torch.nn as nn
 
 def _unwrap_base_model(model: nn.Module) -> nn.Module:
-
+    """
+    Unwrap PEFT model to the underlying HF model if needed.
+    """
     if hasattr(model, "get_base_model"):
         try:
             return model.get_base_model()
@@ -66,7 +82,14 @@ def _token_is_single_id(tokenizer: PreTrainedTokenizerBase, s: str) -> bool:
 
 
 def ensure_phi_cache_compat() -> None:
-
+    """
+    Some local Phi-4/Phi-3 modeling files import SlidingWindowCache, while a
+    few transformers builds expose Cache/DynamicCache/StaticCache but not that
+    symbol. The same local file imports LossKwargs from transformers.utils,
+    which is only a typing helper in newer builds. Training runs with
+    use_cache=False, so these shims only need to satisfy import-time/type
+    checks in the dynamic module.
+    """
     try:
         import transformers.cache_utils as cache_utils
     except Exception:
@@ -113,7 +136,17 @@ def ensure_phi_cache_compat() -> None:
 
 
 def repair_phi_longrope_meta_buffers(model: nn.Module) -> int:
+    """
+    The local Phi-4/Phi-3 dynamic modeling code keeps a second RoPE tensor in
+    `original_inv_freq` as a plain attribute. Some transformers builds
+    materialize the registered `inv_freq` buffer during from_pretrained(), but
+    leave that plain attribute pointing at the meta tensor created at init time.
+    LongRoPE then fails on the first forward when it calls
+    `self.original_inv_freq.to(device)`.
 
+    We always recompute inv_freq from the config to avoid carrying over any
+    corrupted values from the checkpoint.
+    """
     repaired = 0
     for module in model.modules():
         if not (hasattr(module, "inv_freq") and hasattr(module, "original_inv_freq")):
@@ -121,7 +154,7 @@ def repair_phi_longrope_meta_buffers(model: nn.Module) -> int:
         if not (hasattr(module, "rope_init_fn") and hasattr(module, "config")):
             continue
 
-
+        # Always recompute from config to ensure clean values
         inv_freq, attention_scaling = module.rope_init_fn(module.config, torch.device("cpu"))
         module.register_buffer("inv_freq", inv_freq, persistent=False)
         module.original_inv_freq = inv_freq.detach().clone()
@@ -160,10 +193,10 @@ def assert_trainable_parameters_finite(model: nn.Module, where: str) -> None:
         raise FloatingPointError(f"Non-finite trainable parameters at {where}: " + "; ".join(bad))
 
 
-def ensure_apt_token_and_resize(
+def ensure_mid_token_and_resize(
     tokenizer: PreTrainedTokenizerBase,
     model: nn.Module,
-    apt_token: str,
+    mid_token: str,
 ) -> int:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -180,26 +213,29 @@ def ensure_apt_token_and_resize(
                 "Phi models may reserve extra embedding rows, so training should not shrink them."
             )
 
-    tid = tokenizer.convert_tokens_to_ids(apt_token)
-    ok_single = _token_is_single_id(tokenizer, apt_token)
+    tid = tokenizer.convert_tokens_to_ids(mid_token)
+    ok_single = _token_is_single_id(tokenizer, mid_token)
     if tid is None or tid == tokenizer.unk_token_id or not ok_single:
-        tokenizer.add_special_tokens({"additional_special_tokens": [apt_token]})
+        tokenizer.add_special_tokens({"additional_special_tokens": [mid_token]})
         _resize_only_if_needed()
-        tid = tokenizer.convert_tokens_to_ids(apt_token)
-        if tid is None or tid == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, apt_token):
-            raise ValueError(f"Failed to install APT token '{apt_token}' as a single token id.")
+        tid = tokenizer.convert_tokens_to_ids(mid_token)
+        if tid is None or tid == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, mid_token):
+            raise ValueError(f"Failed to install MID token '{mid_token}' as a single token id.")
     else:
         _resize_only_if_needed()
 
     if tokenizer.eos_token_id is not None and tid == tokenizer.eos_token_id:
-        raise ValueError(f"APT token '{apt_token}' resolves to eos_token_id={tid}.")
+        raise ValueError(f"MID token '{mid_token}' resolves to eos_token_id={tid}.")
     if tokenizer.pad_token_id is not None and tid == tokenizer.pad_token_id:
-        raise ValueError(f"APT token '{apt_token}' resolves to pad_token_id={tid}.")
+        raise ValueError(f"MID token '{mid_token}' resolves to pad_token_id={tid}.")
     return int(tid)
 
 
 def find_transformer_layers(model: nn.Module):
-
+    """
+    Robustly locate decoder block list (ModuleList) by scanning the model.
+    Works for Phi/Qwen/LLaMA/GPT-style and PEFT-wrapped models.
+    """
     base = _unwrap_base_model(model)
     cfg = getattr(base, "config", None)
 
@@ -241,6 +277,7 @@ def find_transformer_layers(model: nn.Module):
     return list(best_list)
 
 
+
 def pick_layers(num_layers: int) -> List[int]:
     if num_layers <= 0:
         raise ValueError("num_layers must be > 0")
@@ -259,9 +296,15 @@ def make_layer_weights(k: int) -> Tuple[List[float], List[float]]:
     return doc, chunk
 
 
-def make_view_layer_weights(lambda_chunk: List[float], view_lambda_scale: float) -> List[float]:
-    s = float(view_lambda_scale)
-    return [s * w for w in lambda_chunk]
+def make_view_layer_weights(lambda_doc: List[float], lambda_chunk: List[float]) -> List[float]:
+    """Normalize document/chunk/view weights so they sum to one at each layer."""
+    view = list(lambda_chunk)
+    for i in range(len(lambda_doc)):
+        total = lambda_doc[i] + lambda_chunk[i] + view[i]
+        lambda_doc[i] /= total
+        lambda_chunk[i] /= total
+        view[i] /= total
+    return view
 
 
 def _safe_chunk_id(row: Dict[str, Any], fallback_idx: int) -> str:
@@ -322,6 +365,37 @@ def build_view_prototypes_from_jsonl(
     return F.normalize(protos, p=2, dim=-1)
 
 
+def last_label_index(labels: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    B, T = labels.shape
+    idx = torch.full((B,), T - 1, device=labels.device, dtype=torch.long)
+
+    for b in range(B):
+        pos = torch.where(labels[b] != -100)[0]
+        if len(pos) > 0:
+            idx[b] = pos[-1]
+        else:
+            pos2 = torch.where(attention_mask[b] == 1)[0]
+            idx[b] = pos2[-1] if len(pos2) > 0 else T - 1
+    return idx
+
+
+def prompt_end_index(labels: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    B, T = labels.shape
+    idx = torch.full((B,), T - 1, device=labels.device, dtype=torch.long)
+
+    for b in range(B):
+        pos = torch.where(labels[b] != -100)[0]
+        if len(pos) > 0:
+            idx[b] = max(int(pos[0]) - 1, 0)
+        else:
+            pos2 = torch.where(attention_mask[b] == 1)[0]
+            idx[b] = pos2[-1] if len(pos2) > 0 else T - 1
+    return idx
+
+
+# -------------------------
+# Dataset & Collator
+# -------------------------
 class JSONLSFTDataset(Dataset):
     def __init__(
         self,
@@ -329,13 +403,15 @@ class JSONLSFTDataset(Dataset):
         tokenizer,
         max_seq_len: int,
         add_task_prefix: bool = True,
-        apt_token: str = "<|APT|>",
+        pooling_mode: str = "mid",
+        mid_token: str = "<|MID|>",
     ):
         self.jsonl_path = jsonl_path
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.add_task_prefix = add_task_prefix
-        self.apt_token = str(apt_token)
+        self.pooling_mode = str(pooling_mode)
+        self.mid_token = str(mid_token)
 
         self.rows = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -379,7 +455,10 @@ class JSONLSFTDataset(Dataset):
         if self.add_task_prefix and task:
             task_line = f"Task: {task}\n"
 
-        prompt_text = f"{task_line}{prompt.strip()}\n{self.apt_token}\n\n### Response:\n"
+        if self.pooling_mode == "mid":
+            prompt_text = f"{task_line}{prompt.strip()}\n{self.mid_token}\n\n### Response:\n"
+        else:
+            prompt_text = f"{task_line}{prompt.strip()}\n\n### Response:\n"
         resp_text = response.strip()
         return prompt_text, resp_text
 
@@ -444,6 +523,9 @@ class DataCollatorWithPadding:
         return batch
 
 
+# -------------------------
+# Hook: store pooled z^l only (B x H)
+# -------------------------
 class PooledLayerHook:
     SKIP_DURING_EXTERNAL_FORWARD = False
 
@@ -480,6 +562,9 @@ class PooledLayerHook:
         self.handles = []
 
 
+# -------------------------
+# Custom Trainer
+# -------------------------
 class DualAnchorTrainer(Trainer):
     def __init__(
         self,
@@ -495,7 +580,8 @@ class DualAnchorTrainer(Trainer):
         lambda_doc: List[float],
         lambda_chunk: List[float],
         lambda_view: Optional[List[float]] = None,
-        apt_token_id: int,
+        pooling_mode: str = "prompt_end",
+        mid_token_id: Optional[int] = None,
         **kwargs,
     ):
         self._tok = kwargs.pop("tokenizer", None)
@@ -513,7 +599,8 @@ class DualAnchorTrainer(Trainer):
         self.lambda_view = lambda_view
         self.use_view_anchor = self.view_anchor_emb is not None and self.lambda_view is not None
 
-        self.apt_token_id = int(apt_token_id)
+        self.pooling_mode = str(pooling_mode)
+        self.mid_token_id = int(mid_token_id) if mid_token_id is not None else None
 
         self._last_custom_metrics: Dict[str, float] = {}
 
@@ -653,19 +740,25 @@ class DualAnchorTrainer(Trainer):
         view_id = inputs.pop("view_id", None)
         observed_view_mask = inputs.pop("observed_view_mask", None)
         labels = inputs.get("labels")
+        attention_mask = inputs.get("attention_mask")
 
         device = labels.device
         a_doc, a_chunk, a_view = self._get_anchors(anchor_row_idx, device=device)
 
-        input_ids = inputs["input_ids"]
-        B, _T = input_ids.shape
-        pool_idx = torch.empty((B,), device=input_ids.device, dtype=torch.long)
-        for b in range(B):
-            row = input_ids[b].tolist()
-            try:
-                pool_idx[b] = len(row) - 1 - row[::-1].index(self.apt_token_id)
-            except ValueError as exc:
-                raise ValueError("APT token id not found in training input.") from exc
+        if self.pooling_mode == "mid":
+            if self.mid_token_id is None:
+                raise ValueError("pooling_mode=mid requires mid_token_id to be set in DualAnchorTrainer.")
+            input_ids = inputs["input_ids"]
+            B, _T = input_ids.shape
+            pool_idx = torch.empty((B,), device=input_ids.device, dtype=torch.long)
+            for b in range(B):
+                row = input_ids[b].tolist()
+                try:
+                    pool_idx[b] = len(row) - 1 - row[::-1].index(self.mid_token_id)
+                except ValueError:
+                    pool_idx[b] = prompt_end_index(labels, attention_mask)[b]
+        else:
+            pool_idx = prompt_end_index(labels, attention_mask)
         self._hook.pool_idx = pool_idx
         self._hook.clear()
 
@@ -773,23 +866,26 @@ class FiniteParameterCallback(TrainerCallback):
         return control
 
 
+# -------------------------
+# Main
+# -------------------------
 def main():
     ap = argparse.ArgumentParser()
 
-
+    # IO
     ap.add_argument("--model_name_or_path", type=str, required=True, help="base model path or model id")
     ap.add_argument("--train_jsonl", type=str, required=True, help="*.with_anchor_index.jsonl")
     ap.add_argument("--doc_anchor_pt", type=str, required=True, help="doc_anchor_emb.pt")
     ap.add_argument("--chunk_anchor_pt", type=str, required=True, help="chunk_anchor_emb.pt")
-    ap.add_argument("--view_anchor_pt", type=str, default="", help="optional: view_anchor_emb.pt")
+    ap.add_argument("--view_anchor_pt", type=str, required=True, help="view_anchor_emb.pt")
     ap.add_argument("--output_dir", type=str, required=True)
 
-
+    # training
     ap.add_argument("--max_seq_len", type=int, default=2048)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    ap.add_argument("--num_train_epochs", type=int, default=3)
-    ap.add_argument("--learning_rate", type=float, default=5e-5)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=16)
+    ap.add_argument("--num_train_epochs", type=int, default=2)
+    ap.add_argument("--learning_rate", type=float, default=2e-4)
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--logging_steps", type=int, default=10)
@@ -812,7 +908,7 @@ def main():
         help="load tokenizer with use_fast=True; pass --no-tokenizer_use_fast to force slow/backend fallback",
     )
 
-
+    # lora - Phi-4 uses combined projections
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
@@ -823,13 +919,26 @@ def main():
         help="auto selects Phi qkv_proj/o_proj/gate_up_proj/down_proj; otherwise pass comma-separated module suffixes",
     )
 
-
+    # formula losses
     ap.add_argument("--alpha", type=float, default=0.10, help="weight for anchor loss")
-    ap.add_argument("--view_lambda_scale", type=float, default=0.5, help="per-layer view weight scale relative to chunk weights")
-    ap.add_argument("--beta_route", type=float, default=0.05, help="weight for routing BCE loss")
-    ap.add_argument("--delta_vgc", type=float, default=0.05, help="weight for view-geometry consistency loss")
+    ap.add_argument("--beta_route", type=float, default=0.10, help="weight rho for routing BCE loss")
+    ap.add_argument("--delta_vgc", type=float, default=0.10, help="weight delta for view-geometry consistency loss")
 
-    ap.add_argument("--apt_token", type=str, default="<|APT|>", help="Dedicated APT token inserted before ### Response.")
+    # pooling alignment (Scheme B)
+    ap.add_argument(
+        "--pooling_mode",
+        type=str,
+        default="mid",
+        choices=["prompt_end", "mid"],
+        help="Where to pool hidden states for anchor guidance. 'mid' pools at a dedicated MID token inserted before ### Response.",
+    )
+    ap.add_argument("--mid_token", type=str, default="<|MID|>", help="Dedicated MID token used when pooling_mode=mid")
+    ap.add_argument(
+        "--ensure_mid_token",
+        action="store_true",
+        default=True,
+        help="Auto-add MID token to tokenizer and resize embeddings if missing.",
+    )
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -839,7 +948,7 @@ def main():
 
     model_cfg = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=False)
 
-
+    # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         use_fast=bool(args.tokenizer_use_fast),
@@ -854,7 +963,7 @@ def main():
         "fp32": torch.float32,
     }[args.dtype]
 
-
+    # model
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch_dtype,
@@ -864,26 +973,33 @@ def main():
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
-    apt_token_id = ensure_apt_token_and_resize(tokenizer, model, args.apt_token)
+    mid_token_id = None
+    if args.pooling_mode == "mid":
+        if args.ensure_mid_token:
+            mid_token_id = ensure_mid_token_and_resize(tokenizer, model, args.mid_token)
+        else:
+            mid_token_id = tokenizer.convert_tokens_to_ids(args.mid_token)
+            if mid_token_id is None or mid_token_id == tokenizer.unk_token_id or not _token_is_single_id(tokenizer, args.mid_token):
+                raise ValueError("MID token missing or not a single token id. Enable --ensure_mid_token.")
 
-
+    # load anchor embeddings (CPU)
     doc_anchor = torch.load(args.doc_anchor_pt, map_location="cpu")
     chunk_anchor = torch.load(args.chunk_anchor_pt, map_location="cpu")
-    view_anchor = torch.load(args.view_anchor_pt, map_location="cpu") if args.view_anchor_pt else None
+    view_anchor = torch.load(args.view_anchor_pt, map_location="cpu")
     assert doc_anchor.shape == chunk_anchor.shape, "doc/chunk anchor embeddings must be line-aligned with same shape"
-    if view_anchor is not None:
-        assert doc_anchor.shape == view_anchor.shape, "view anchor embeddings must be line-aligned with doc/chunk shape"
+    assert doc_anchor.shape == view_anchor.shape, "view anchor embeddings must be line-aligned with doc/chunk shape"
     anchor_dim = doc_anchor.shape[1]
 
-
+    # add projection heads: z(hidden_size) -> anchor_dim
     hidden_size = model.config.hidden_size
     model.anchor_proj_doc = nn.Linear(hidden_size, anchor_dim, bias=False)
     model.anchor_proj_chunk = nn.Linear(hidden_size, anchor_dim, bias=False)
-    if view_anchor is not None:
-        model.anchor_proj_view = nn.Linear(hidden_size, anchor_dim, bias=False)
+    model.anchor_proj_view = nn.Linear(hidden_size, anchor_dim, bias=False)
     model.anchor_proj_route = nn.Linear(hidden_size, len(VIEW_NAMES), bias=False)
 
-
+    # LoRA target modules. Phi-4-mini uses the Phi3 implementation with
+    # combined qkv/gate_up projections; Qwen/LLaMA-style models use split
+    # projections. Keep explicit override support for experiments.
     if args.lora_target_modules.strip().lower() == "auto":
         mt = str(getattr(model_cfg, "model_type", "")).lower()
         if mt in {"phi3", "phi"}:
@@ -895,8 +1011,7 @@ def main():
     print(f"[INFO] model_type={getattr(model_cfg, 'model_type', '')} dtype={args.dtype}")
     print(f"[INFO] LoRA target_modules={target_modules}")
     modules_to_save = ["anchor_proj_doc", "anchor_proj_chunk", "anchor_proj_route"]
-    if view_anchor is not None:
-        modules_to_save.append("anchor_proj_view")
+    modules_to_save.append("anchor_proj_view")
     lora_cfg = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -909,12 +1024,12 @@ def main():
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-
+    # layers & weights
     layers = find_transformer_layers(model)
     num_layers = len(layers)
     layer_ids = pick_layers(num_layers)
     lambda_doc, lambda_chunk = make_layer_weights(len(layer_ids))
-    lambda_view = make_view_layer_weights(lambda_chunk, args.view_lambda_scale) if view_anchor is not None else None
+    lambda_view = make_view_layer_weights(lambda_doc, lambda_chunk)
 
     print(f"[INFO] num_layers={num_layers}, selected_layers={layer_ids}")
     print(f"[INFO] lambda_doc={lambda_doc}, lambda_chunk={lambda_chunk}")
@@ -922,7 +1037,7 @@ def main():
         print(f"[INFO] lambda_view={lambda_view}")
     print(f"[INFO] anchors: N={doc_anchor.shape[0]}, D={anchor_dim}")
 
-
+    # Build fixed view prototypes for energy-alignment target.
     view_prototypes = build_view_prototypes_from_jsonl(
         jsonl_paths=[args.train_jsonl],
         view_anchor=view_anchor,
@@ -942,12 +1057,13 @@ def main():
         jsonl_path=args.train_jsonl,
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
-        add_task_prefix=False,
-        apt_token=args.apt_token,
+        add_task_prefix=True,
+        pooling_mode=args.pooling_mode,
+        mid_token=args.mid_token,
     )
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-
+    # training args
     targs = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -987,7 +1103,8 @@ def main():
         lambda_doc=lambda_doc,
         lambda_chunk=lambda_chunk,
         lambda_view=lambda_view,
-        apt_token_id=apt_token_id,
+        pooling_mode=args.pooling_mode,
+        mid_token_id=mid_token_id,
         tokenizer=tokenizer,
     )
 

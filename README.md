@@ -1,107 +1,60 @@
-# Anchoring Latent Representations for Controlled Long-Document Question-Answer Generation
+# ALR-QA
 
-## 1. 🧰 Set Up the Environment
+## 1. Environment and Models
 
 ```bash
-cd ""
+cd ALR-QA-anonymous
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-## 2. 🧠 Prepare the Models
+Fill in the model names, API settings, input paths, and output paths in `.env`. The pipeline requires a Teacher API model, an Anchor Encoder, and a Base Generator. Set `ARCH=qwen` or `ARCH=phi` to select the generator entry point.
 
-Reproducing this pipeline requires three types of models.
+## 2. Split the Data
 
-Teacher API model: used to build the training data.
-
-Anchor encoder: used to precompute document/chunk/view anchors offline, such as BGE-M3.
-
-Base generator model: used for LoRA training and final inference. This repository provides two entry points:
-
-```text
-ARCH=qwen  -> train/qwen/train.py, inference/qwen/infer.py
-ARCH=phi   -> train/phi/train.py, inference/phi/infer.py
-```
-
-Training will produce a LoRA adapter, which is loaded during inference through `LORA_DIR`.
-
-## 3. 🔐 Fill in `.env`
-
-The `.env` file in this repository is empty by default. It only keeps credentials, model names/paths, and the main output directory:
-
-```text
-API_KEY=
-API_BASE_URL=
-TEACHER_MODEL=
-ENCODER_MODEL=
-BASE_MODEL=
-OUTPUT_DIR=
-```
-
-For inference, also fill in:
-
-```text
-LORA_DIR=
-```
-
-## 4. ✂️ Split the Chunk Data
-
-Split chunks by document with an 8:1:1 train/validation/test ratio, so chunks from the same document do not appear in different splits.
+Split the chunks by document so that chunks from the same document do not appear in different data splits:
 
 ```bash
 bash scripts/run_pipeline.sh split
 ```
 
-Outputs are written to `SPLIT_OUT_DIR`:
+The resulting train, validation, and test files are written to `SPLIT_OUT_DIR`.
 
-```text
-{name}_train.jsonl
-{name}_val.jsonl
-{name}_test.jsonl
-{name}_split_manifest.json
-```
+## 3. Build the Training Data and Anchors
 
-## 5. 📦 Build the View-Conditioned Training Dataset
+Use the Teacher API to create view-conditioned QA training data:
 
 ```bash
 bash scripts/run_pipeline.sh dataset
 ```
 
-This step reads the training split and calls the teacher API to generate view-conditioned QA data for SFT.
-
-Outputs are written to `DATASET_OUT_DIR`:
-
-```text
-teacher_raw.jsonl
-view_conditioned_qa.jsonl
-view_conditioned_sft.jsonl
-```
-
-## 6. 🧭 Build Offline Anchors
+Then encode the document, chunk, and view anchors:
 
 ```bash
 bash scripts/run_pipeline.sh anchors
 ```
 
-Outputs are written to `ANCHOR_OUT_DIR`:
+Main outputs:
 
 ```text
+teacher_raw.jsonl
+view_conditioned_qa.jsonl
+view_conditioned_sft.jsonl
 doc_anchor_emb.pt
 chunk_anchor_emb.pt
 view_anchor_emb.pt
 view_conditioned_sft.with_anchor_index.jsonl
 ```
 
-## 7. 🚀 Train
-
-After setting the required training variables:
+## 4. Train
 
 ```bash
 bash scripts/run_pipeline.sh train
 ```
 
-You can also run each architecture directly:
+The architecture-specific entry points can also be called directly:
 
 ```bash
 python train/qwen/train.py \
@@ -109,6 +62,7 @@ python train/qwen/train.py \
   --train_jsonl "" \
   --doc_anchor_pt "" \
   --chunk_anchor_pt "" \
+  --view_anchor_pt "" \
   --output_dir ""
 
 python train/phi/train.py \
@@ -116,24 +70,27 @@ python train/phi/train.py \
   --train_jsonl "" \
   --doc_anchor_pt "" \
   --chunk_anchor_pt "" \
+  --view_anchor_pt "" \
   --output_dir ""
 ```
 
-## 8. 🔎 Generate QA with Inference
+Training saves the LoRA adapter, anchor projection heads, routing head, and view prototypes.
 
-The test split also needs encoded anchors first:
+## 5. Generate QA
+
+First, generate anchors for the input chunks:
 
 ```bash
 bash scripts/run_pipeline.sh infer-anchors
 ```
 
-Then run inference:
+Then generate the QA pairs:
 
 ```bash
 bash scripts/run_pipeline.sh infer
 ```
 
-Direct entry points:
+The inference entry points can also be called directly:
 
 ```bash
 python inference/qwen/infer.py \
@@ -153,8 +110,51 @@ python inference/phi/infer.py \
   --output_jsonl ""
 ```
 
-Each inference output line is one QA record:
+Each output line contains one QA record:
 
 ```json
 {"doc_id": "...", "chunk_id": "...", "selected_views": ["..."], "view": "...", "question": "...", "answer": "..."}
 ```
+
+## 6. Evaluation
+
+The evaluation code is located in [`evaluation/`](evaluation) and provides the following metrics:
+
+- QRelScore (QRel)
+- Source Hit@5
+- Diverse@10 (D@10)
+- Self-CosSim (SelfSim)
+- RAGAS Faithfulness (FAI)
+- RAGAS Answer Relevancy (REL)
+
+Install the evaluation dependencies:
+
+```bash
+pip install -r evaluation/requirements.txt
+```
+
+QRel, Hit@5, D@10, and SelfSim require a sentence embedding model, a word-alignment model, and a causal language model:
+
+```bash
+python evaluation/eval_qa_metrics.py \
+  --qa_file "" \
+  --chunks_file "" \
+  --out_dir "" \
+  --sim_model "" \
+  --word_model "" \
+  --clm_model ""
+```
+
+FAI and REL require an OpenAI-compatible evaluation model and an embedding model:
+
+```bash
+OPENAI_API_KEY="" python evaluation/eval_ragas.py \
+  --qa_file "" \
+  --chunks_file "" \
+  --out_dir "" \
+  --llm_model "" \
+  --api_base_url "" \
+  --embedding_model ""
+```
+
+`qa_file` must be a JSON or JSONL file containing `chunk_id`, `question`, and `answer`. `chunks_file` must contain the chunk ID and source text. Results are written to the specified `out_dir`.

@@ -1,0 +1,8 @@
+# Dependencies needed only for the paper's evaluation section.
+numpy
+openai
+ragas
+scikit-learn
+torch
+tqdm
+transformers

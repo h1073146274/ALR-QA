@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Precompute anchor embeddings for Route-B training.
+
+Input:
+  - JSONL with fields: doc_anchor_text, chunk_anchor_text, view (optional)
+Output:
+  - doc_anchor_emb.pt / .npy    (N x D)
+  - chunk_anchor_emb.pt / .npy  (N x D)
+  - view_anchor_emb.pt / .npy   (N x D, optional)
+  - optional: a new JSONL with anchor indices (line-aligned)
+
+Notes:
+  - Uses ONE encoder for doc/chunk/view anchors.
+  - Mean-pooling over last hidden states with attention mask.
+  - Caches unique texts to avoid redundant encoding.
+"""
 
 import argparse
 import json
@@ -23,10 +40,10 @@ VIEW_DESCRIPTIONS = {
 
 
 def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-
-    mask = attention_mask.unsqueeze(-1).to(last_hidden.dtype)
-    summed = (last_hidden * mask).sum(dim=1)
-    denom = mask.sum(dim=1).clamp_min(1e-6)
+    # last_hidden: [B, T, D], mask: [B, T]
+    mask = attention_mask.unsqueeze(-1).to(last_hidden.dtype)  # [B, T, 1]
+    summed = (last_hidden * mask).sum(dim=1)                   # [B, D]
+    denom = mask.sum(dim=1).clamp_min(1e-6)                    # [B, 1]
     return summed / denom
 
 
@@ -59,18 +76,31 @@ def encode_texts(
         else:
             out = model(**enc)
 
-        pooled = mean_pool(out.last_hidden_state, enc["attention_mask"])
+        pooled = mean_pool(out.last_hidden_state, enc["attention_mask"])  # [B, D]
 
         if normalize:
             pooled = torch.nn.functional.normalize(pooled, p=2, dim=-1)
 
         all_embs.append(pooled.detach().cpu())
 
-    return torch.cat(all_embs, dim=0)
+    return torch.cat(all_embs, dim=0)  # [N, D]
 
 
 def _flatten_merged_qa_result(obj: Dict[str, Any]) -> List[dict]:
+    """
+    Flatten merged QA generation results into row-level QA samples.
 
+    Expected input shape:
+      {"chunk_results": [
+        {"chunk_id": ..., "chunk_summary": ..., "keywords": ...,
+         "candidate_results": [
+           {"qualified_qa_pairs": [{"meta": {"view": ...}, ...}]}
+         ]}
+      ]}
+
+    We use qualified_qa_pairs as the source of accepted training rows because
+    accepted_results in these files do not preserve the view label.
+    """
     chunk_results = obj.get("chunk_results")
     if not isinstance(chunk_results, list):
         return []
@@ -124,7 +154,9 @@ def _flatten_merged_qa_result(obj: Dict[str, Any]) -> List[dict]:
 
 
 def read_jsonl(path: Path) -> List[dict]:
-
+    """
+    Read either JSONL (one object per line) or JSON array (.json).
+    """
     with path.open("r", encoding="utf-8") as f:
         pos = f.tell()
         ch = f.read(1)
@@ -230,7 +262,16 @@ def build_view_texts(
     view_field: str,
     view_source: str,
 ) -> Tuple[List[str], str]:
+    """
+    Build line-aligned view anchor texts.
 
+    field:
+      Use row[view_field] / row.meta[view_field]. Empty rows become empty anchors.
+    canonical_mean:
+      Use one shared text containing all canonical view descriptions for every row.
+    auto:
+      Use row-level view labels when present; otherwise fall back to canonical_mean.
+    """
     if view_source not in {"field", "canonical_mean", "auto"}:
         raise ValueError(f"Unsupported view_source={view_source}")
 
@@ -337,7 +378,7 @@ def main():
     if n == 0:
         raise RuntimeError(f"No rows found in {in_path}")
 
-
+    # Collect texts (line-aligned), with fallbacks for chunk datasets
     doc_texts = []
     chunk_texts = []
     for r in rows:
@@ -355,7 +396,7 @@ def main():
         view_texts = []
     view_prototype_texts = [_view_text_from_label(v) for v in VIEW_DESCRIPTIONS] if args.encode_view else []
 
-
+    # Build cache of unique texts across doc+chunk(+view)
     uniq_map: Dict[str, int] = {}
     uniq_texts: List[str] = []
     all_anchor_texts = doc_texts + chunk_texts + view_texts + view_prototype_texts
@@ -365,7 +406,7 @@ def main():
             uniq_map[t] = len(uniq_texts)
             uniq_texts.append(t)
 
-
+    # Load encoder
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
         print("[WARN] CUDA not available, switching to CPU.")
@@ -390,7 +431,7 @@ def main():
     print(f"[INFO] Unique anchor texts: {len(uniq_texts)}")
     print(f"[INFO] Encoding on {device}, batch={args.batch_size}, max_length={args.max_length}, bf16={args.bf16}, normalize={args.normalize}")
 
-
+    # Encode unique texts once
     uniq_emb = encode_texts(
         texts=uniq_texts,
         tokenizer=tokenizer,
@@ -400,9 +441,9 @@ def main():
         max_length=args.max_length,
         use_bf16=args.bf16,
         normalize=args.normalize,
-    )
+    )  # [U, D]
 
-
+    # Rebuild line-aligned embeddings by index lookup
     doc_idx = torch.tensor([uniq_map[t.strip()] for t in doc_texts], dtype=torch.long)
     chunk_idx = torch.tensor([uniq_map[t.strip()] for t in chunk_texts], dtype=torch.long)
     view_idx = torch.tensor([uniq_map[t.strip()] for t in view_texts], dtype=torch.long) if args.encode_view else None
@@ -412,12 +453,12 @@ def main():
         else None
     )
 
-    doc_emb = uniq_emb.index_select(0, doc_idx)
-    chunk_emb = uniq_emb.index_select(0, chunk_idx)
-    view_emb = uniq_emb.index_select(0, view_idx) if args.encode_view else None
-    view_proto_emb = uniq_emb.index_select(0, view_proto_idx) if args.encode_view else None
+    doc_emb = uniq_emb.index_select(0, doc_idx)     # [N, D]
+    chunk_emb = uniq_emb.index_select(0, chunk_idx) # [N, D]
+    view_emb = uniq_emb.index_select(0, view_idx) if args.encode_view else None  # [N, D]
+    view_proto_emb = uniq_emb.index_select(0, view_proto_idx) if args.encode_view else None  # [V, D]
 
-
+    # Save
     doc_pt = out_dir / "doc_anchor_emb.pt"
     chunk_pt = out_dir / "chunk_anchor_emb.pt"
     view_pt = out_dir / "view_anchor_emb.pt"
@@ -441,7 +482,7 @@ def main():
         np.save(out_dir / "view_prototype_emb.npy", view_proto_emb.numpy())
     np.save(out_dir / "anchor_text_unique_emb.npy", uniq_emb.numpy())
 
-
+    # Save meta for unique texts (so you can debug / reuse)
     meta = {
         "encoder_name_or_path": args.encoder_name_or_path,
         "max_length": args.max_length,
@@ -458,14 +499,14 @@ def main():
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-
+    # Optional: write an indexed jsonl (line index matches embedding row)
     if args.write_indexed_jsonl:
         out_jsonl = out_dir / (in_path.stem + ".with_anchor_index.jsonl")
         new_rows = []
         for i, r in enumerate(rows):
             rr = dict(r)
             rr["anchor_row_idx"] = i
-
+            # (doc/chunk are line-aligned, so same idx)
             if args.encode_view:
                 rr["view_anchor_idx"] = i
                 rr["view_anchor_source"] = view_source_used

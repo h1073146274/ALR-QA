@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import argparse
 import json
@@ -116,32 +117,6 @@ def chat_json(client: Any, model: str, prompt: str, temperature: float, retries:
     raise RuntimeError(str(last_error))
 
 
-def chat_text(client: Any, model: str, prompt: str, temperature: float, retries: int) -> str:
-    last_error = None
-    for attempt in range(retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-            )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as exc:
-            last_error = exc
-            time.sleep(min(2 ** attempt, 8))
-    raise RuntimeError(str(last_error))
-
-
-def strip_labeled_text(text: str, label: str) -> str:
-    value = (text or "").strip()
-    if value.startswith("```"):
-        value = value.strip("`").strip()
-    prefix = f"{label}:"
-    if value.lower().startswith(prefix.lower()):
-        value = value[len(prefix):].strip()
-    return value
-
-
 def accepted(verdict: dict[str, Any]) -> bool:
     return (
         int(verdict.get("view_alignment", 0) or 0) >= 4
@@ -182,13 +157,13 @@ def make_sft_rows(base: dict[str, Any], qa: dict[str, Any], a: dict[str, Any]) -
             **common,
             "task": "qgen",
             "prompt": strip_response_header(build_question_prompt_sft(ctx=ctx, view=view, existing_questions=[])),
-            "response": f"Question: {q}",
+            "response": q,
         },
         {
             **common,
             "task": "agen",
             "prompt": strip_response_header(build_answer_prompt_sft(ctx=ctx, question=q, view=view)),
-            "response": f"Answer: {ans}",
+            "response": ans,
             "question": q,
         },
     ]
@@ -246,18 +221,18 @@ def main() -> None:
         views = selected.get("views", []) if isinstance(selected, dict) else selected
         if not isinstance(views, list):
             views = []
-        existing_questions: list[str] = []
         for view in views[: args.k]:
             view = str(view or "").strip()
             if not view:
                 continue
-            q_prompt = build_teacher_question_prompt(view=view, chunk_text=body, existing_questions=existing_questions)
-            question = strip_labeled_text(chat_text(client, args.model, q_prompt, args.temperature, args.retries), "Question")
+            q_prompt = build_teacher_question_prompt(view=view, chunk_text=body)
+            q_obj = chat_json(client, args.model, q_prompt, args.temperature, args.retries)
+            question = str((q_obj or {}).get("question", "") if isinstance(q_obj, dict) else q_obj).strip()
             if not question:
                 continue
-            existing_questions.append(question)
             a_prompt = build_teacher_answer_prompt(view=view, question=question, chunk_text=body)
-            answer = strip_labeled_text(chat_text(client, args.model, a_prompt, args.temperature, args.retries), "Answer")
+            a_obj = chat_json(client, args.model, a_prompt, args.temperature, args.retries)
+            answer = str((a_obj or {}).get("answer", "") if isinstance(a_obj, dict) else a_obj).strip()
             if not answer:
                 continue
             qa = {"view": view, "question": question, "answer": answer}

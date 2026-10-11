@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Prompt builders for view-conditioned QA generation.
+
+This module follows the prompt flow in ``提示词.docx``:
+1. select suitable views for a chunk;
+2. generate a question under each selected view and the current chunk;
+3. generate the answer from the same view, generated question, and chunk body.
+
+There is intentionally no intermediate evidence extraction step.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +27,7 @@ VIEW_DEFS: Dict[str, str] = {
     "quantitative": "Ask for numbers, metrics, time, stages, or other structured facts answerable from the Body.",
 }
 
-DEFAULT_APT_TOKEN = "<|APT|>"
+DEFAULT_MID_TOKEN = "<|MID|>"
 
 
 @dataclass(frozen=True)
@@ -40,14 +50,14 @@ def _response_header() -> str:
     return "\n\n### Response:\n"
 
 
-def _chunk_body_block(ctx: QAContext) -> str:
-    return f"[Chunk Body]\n{ctx.body.strip()}"
+def _context_blocks(ctx: QAContext, *, include_anchors: bool = False) -> str:
+    """Return the generation context specified by Eqs. (11) and (12).
 
-
-def _context_blocks(ctx: QAContext, *, include_anchors: bool = True) -> str:
+    Document and chunk anchors supervise latent states; they are not appended to
+    the language-model input.  This keeps the probe prefix to (view,
+    definition, chunk, APT), as defined in the paper.
+    """
     blocks = []
-    if ctx.title.strip():
-        blocks.append(f"[Title]\n{ctx.title.strip()}")
     if include_anchors and ctx.article_summary.strip():
         blocks.append(f"[Document Anchor]\nSummary: {ctx.article_summary.strip()}")
     if include_anchors and _safe_join(ctx.doc_keywords):
@@ -71,7 +81,7 @@ def build_question_probe_prompt(
     view_name: Optional[str] = None,
     view_definition: Optional[str] = None,
     view: Optional[str] = None,
-    apt_token: Optional[str] = DEFAULT_APT_TOKEN,
+    mid_token: Optional[str] = DEFAULT_MID_TOKEN,
     title: str = "",
     add_task_prefix: bool = True,
     minimal_context: bool = False,
@@ -93,8 +103,8 @@ def build_question_probe_prompt(
         + "Read the chunk and prepare to generate one question under the specified view. "
         + "Do not generate the question yet; use the special token as the routing position.\n\n"
         + f"[View]\nname: {eff_view}\ninstruction: {eff_def}\n\n"
-        + _context_blocks(ctx, include_anchors=not minimal_context)
-        + f"\n\n{apt_token}"
+        + _context_blocks(ctx)
+        + f"\n\n{mid_token}"
         + _response_header()
     )
 
@@ -115,6 +125,7 @@ def build_question_prompt_sft(
     attempt_round: int = 1,
     add_task_prefix: bool = True,
     existing_questions: Optional[Sequence[str]] = None,
+    strict_json: bool = False,
     minimal_context: bool = False,
 ) -> str:
     if ctx is None:
@@ -129,20 +140,26 @@ def build_question_prompt_sft(
     eff_view = view_name or view or ""
     eff_def = view_definition or VIEW_DEFS.get(eff_view, "")
     previous = "\n".join(f"- {q}" for q in (existing_questions or []) if str(q).strip())
-    previous_text = previous if previous else "None"
+    previous_block = f"\nAvoid duplicating these already generated questions:\n{previous}\n" if previous else ""
+    output_rule = (
+        'Return JSON: {"question": "..."}'
+        if strict_json
+        else "Return only the question text."
+    )
+    task = "Task: Generate one view-conditioned question.\n" if add_task_prefix else ""
     return (
-        "Task: Write ONE clear and natural question under the selected view.\n\n"
-        "Guidelines:\n"
-        "1) Use the selected view to guide the questioning perspective.\n"
-        "2) Generate the question from the Chunk Body.\n"
-        "3) The question should be specific and answerable from the Chunk Body.\n"
-        "4) Avoid duplicating these earlier questions:\n"
-        f"{previous_text}\n\n"
-        "Return the question in this format:\n"
-        "Question: <question>\n\n"
-        "[Selected_View]\n"
-        f"{eff_view}: {eff_def}\n\n"
-        + _chunk_body_block(ctx)
+        task
+        + "You are constructing training data for controlled long-document QA generation.\n\n"
+        + f"[Selected View]\nname: {eff_view}\ninstruction: {eff_def}\n\n"
+        + _context_blocks(ctx)
+        + "\n\nRequirements:\n"
+        + "1. Generate exactly one natural question under the selected view.\n"
+        + "2. The question must be answerable from the Chunk Body.\n"
+        + "3. Do not use external knowledge.\n"
+        + "4. Avoid vague, overly broad, duplicate, or multi-part questions.\n"
+        + previous_block
+        + output_rule
+        + _response_header()
     )
 
 
@@ -184,6 +201,7 @@ def build_answer_prompt_sft(
     doc_keywords: Sequence[str] | str = (),
     chunk_summary: str = "",
     chunk_keywords: Sequence[str] | str = (),
+    evidence: str = "",
     question: str,
     view_name: Optional[str] = None,
     view_definition: Optional[str] = None,
@@ -191,10 +209,11 @@ def build_answer_prompt_sft(
     title: str = "",
     n_answers: int = 1,
     add_task_prefix: bool = True,
+    strict_json: bool = False,
 ) -> str:
     if ctx is None:
         ctx = QAContext(
-            body=body,
+            body=body or evidence,
             article_summary=article_summary,
             doc_keywords=doc_keywords if not isinstance(doc_keywords, str) else [doc_keywords],
             chunk_summary=chunk_summary,
@@ -203,19 +222,25 @@ def build_answer_prompt_sft(
         )
     eff_view = view_name or view or ""
     eff_def = view_definition or VIEW_DEFS.get(eff_view, "")
+    output_rule = (
+        'Return JSON: {"answer": "..."}'
+        if strict_json
+        else "Return only the answer text."
+    )
+    task = "Task: Generate the grounded answer for the question.\n" if add_task_prefix else ""
     return (
-        "Task: Answer the question based on the Chunk Body.\n\n"
-        "Guidelines:\n"
-        "1) Keep the answer concise and directly responsive to the question.\n"
-        "2) The answer should be supported by the Chunk Body.\n"
-        "3) Do not use information outside the Chunk Body.\n\n"
-        "Return the answer in this format:\n"
-        "Answer: <answer>\n\n"
-        "[Selected_View]\n"
-        f"{eff_view}: {eff_def}\n\n"
-        "[Question]\n"
-        f"{question.strip()}\n\n"
-        + _chunk_body_block(ctx)
+        task
+        + "You are constructing training data for controlled long-document QA generation.\n\n"
+        + f"[Selected View]\nname: {eff_view}\ninstruction: {eff_def}\n\n"
+        + f"[Question]\n{question.strip()}\n\n"
+        + _context_blocks(ctx)
+        + "\n\nRequirements:\n"
+        + "1. Answer strictly using the Chunk Body.\n"
+        + "2. Do not use external knowledge.\n"
+        + "3. If the Chunk Body does not contain the answer, return: Not stated in the Body.\n"
+        + "4. Be concise and directly answer the question.\n"
+        + output_rule
+        + _response_header()
     )
 
 
@@ -248,19 +273,26 @@ def build_view_selection_prompt(
     )
 
 
-def build_teacher_question_prompt(*, view: str, chunk_text: str, existing_questions: Optional[Sequence[str]] = None) -> str:
-    return build_question_prompt_sft(
-        ctx=QAContext(body=chunk_text),
-        view=view,
-        existing_questions=existing_questions,
+def build_teacher_question_prompt(*, view: str, chunk_text: str) -> str:
+    return (
+        "You are generating a view-conditioned question for controlled long-document QA generation.\n\n"
+        f"[Selected View]\n{view}: {VIEW_DEFS.get(view, '')}\n\n"
+        f"[Chunk Body]\n{chunk_text}\n\n"
+        "Generate exactly one natural question under the selected view. The question must be answerable from the chunk body. "
+        "Do not use external knowledge. Avoid vague, overly broad, duplicate, or multi-part questions.\n\n"
+        'Return JSON: {"question": "..."}'
     )
 
 
 def build_teacher_answer_prompt(*, view: str, question: str, chunk_text: str) -> str:
-    return build_answer_prompt_sft(
-        ctx=QAContext(body=chunk_text),
-        view=view,
-        question=question,
+    return (
+        "You are generating a grounded answer for controlled long-document QA generation.\n\n"
+        f"[Selected View]\n{view}: {VIEW_DEFS.get(view, '')}\n\n"
+        f"[Question]\n{question}\n\n"
+        f"[Chunk Body]\n{chunk_text}\n\n"
+        "Generate one concise answer using only the chunk body. Do not use external knowledge. "
+        "If the chunk body does not contain the answer, return: Not stated in the Body.\n\n"
+        'Return JSON: {"answer": "..."}'
     )
 
 

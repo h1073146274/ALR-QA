@@ -24,25 +24,12 @@ require_var() {
 }
 
 split_chunks() {
-  require_var DOCUMENT_JSONL
+  require_var CHUNK_JSONL
   require_var SPLIT_OUT_DIR
-  require_var CORPUS_NAME
-  require_var TOKENIZER_NAME_OR_PATH
-  require_var MIN_CHUNK_TOKENS
-  require_var MAX_CHUNK_TOKENS
-  require_var CHUNK_OVERLAP_TOKENS
-  require_var SAMPLE_DOCS
-  require_var SPLIT_SEED
   "${PYTHON_BIN}" "${ROOT}/scripts/split_chunks.py" \
-    --input "${DOCUMENT_JSONL}" \
+    --input "${CHUNK_JSONL}" \
     --out_dir "${SPLIT_OUT_DIR}" \
-    --name "${CORPUS_NAME}" \
-    --tokenizer_name_or_path "${TOKENIZER_NAME_OR_PATH}" \
-    --min_tokens "${MIN_CHUNK_TOKENS}" \
-    --max_tokens "${MAX_CHUNK_TOKENS}" \
-    --overlap_tokens "${CHUNK_OVERLAP_TOKENS}" \
-    --sample_docs "${SAMPLE_DOCS}" \
-    --seed "${SPLIT_SEED}"
+    --name "${CORPUS_NAME:-}"
 }
 
 build_dataset() {
@@ -84,6 +71,7 @@ train_model() {
   require_var OUTPUT_DIR
   require_var DOC_ANCHOR
   require_var CHUNK_ANCHOR
+  require_var VIEW_ANCHOR
   local train_jsonl="${TRAIN_JSONL:-}"
   if [[ -z "${train_jsonl}" ]]; then
     require_var ANCHOR_OUT_DIR
@@ -93,31 +81,25 @@ train_model() {
   if [[ "${ARCH}" == "phi" ]]; then
     TRAIN_ENTRY="${ROOT}/train/phi/train.py"
   fi
-  local learning_rate="${LR:-}"
-  if [[ -z "${learning_rate}" ]]; then
-    if [[ "${ARCH}" == "phi" ]]; then
-      learning_rate="5e-5"
-    else
-      learning_rate="1e-4"
-    fi
-  fi
   "${PYTHON_BIN}" "${TRAIN_ENTRY}" \
     --model_name_or_path "${BASE_MODEL}" \
     --train_jsonl "${train_jsonl}" \
     --doc_anchor_pt "${DOC_ANCHOR}" \
     --chunk_anchor_pt "${CHUNK_ANCHOR}" \
-    --view_anchor_pt "${VIEW_ANCHOR:-}" \
+    --view_anchor_pt "${VIEW_ANCHOR}" \
     --output_dir "${OUTPUT_DIR}" \
     --max_seq_len "${MAX_SEQ_LEN:-2048}" \
-    --apt_token "<|APT|>" \
+    --pooling_mode mid \
+    --mid_token "<|MID|>" \
+    --ensure_mid_token \
     --per_device_train_batch_size "${BATCH:-1}" \
-    --gradient_accumulation_steps "${GAS:-8}" \
-    --num_train_epochs "${EPOCHS:-3}" \
+    --gradient_accumulation_steps "${GAS:-16}" \
+    --num_train_epochs "${EPOCHS:-2}" \
     --max_steps "${MAX_STEPS:--1}" \
-    --learning_rate "${learning_rate}" \
-    --alpha "${ALPHA:-0.08}" \
-    --beta_route "${BETA_ROUTE:-0.05}" \
-    --delta_vgc "${DELTA_VGC:-0.05}" \
+    --learning_rate "${LR:-2e-4}" \
+    --alpha "${ALPHA:-0.1}" \
+    --beta_route "${BETA_ROUTE:-0.1}" \
+    --delta_vgc "${DELTA_VGC:-0.1}" \
     --logging_steps "${LOGGING_STEPS:-10}" \
     --save_steps "${SAVE_STEPS:-500}" \
     --seed "${SEED:-42}"
